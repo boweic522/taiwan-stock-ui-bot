@@ -1,0 +1,6 @@
+discord.py>=2.3.0
+yfinance>=1.0.0
+mplfinance>=0.12.9b7
+matplotlib>=3.7.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
