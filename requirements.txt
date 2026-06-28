@@ -4,5 +4,5 @@ mplfinance>=0.12.9b7
 matplotlib>=3.7.0
 pandas>=2.0.0
 python-dotenv>=1.0.0
-twstock>=1.6.0
+twstock>=1.5.0
 requests>=2.31.0
