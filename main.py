@@ -262,7 +262,7 @@ async def cmd_help(ctx: commands.Context):
     )
     embed.add_field(
         name="📌 顯示內容",
-        value="一句話｜劇本｜位置｜計畫｜補充，主畫面只留關鍵價位。",
+        value="一句話｜劇本｜位置｜計畫｜補充；整合三週期、盤型、關鍵位與三根K。",
         inline=False,
     )
     embed.add_field(
