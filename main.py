@@ -10,6 +10,32 @@ from trade_view import build_trade_view
 
 
 # ────────────────────────────────────────────
+# 股票名稱顯示：優先使用 twstock 中文名
+# ────────────────────────────────────────────
+
+def _plain_code(code: object) -> str:
+    raw = str(code or "").upper().strip()
+    return raw.replace(".TW", "").replace(".TWO", "")
+
+
+def _resolve_chinese_name(data: dict, fallback_code: str = "") -> str:
+    """UI 顯示優先用中文公司名稱；抓不到才回退 data['name']。"""
+    code = _plain_code(data.get("code") or fallback_code)
+
+    try:
+        import twstock  # type: ignore
+        stock = twstock.codes.get(code)
+        name = getattr(stock, "name", None)
+        if name:
+            return str(name)
+    except Exception:
+        pass
+
+    name = str(data.get("name") or "").strip()
+    return name or code or "未知股票"
+
+
+# ────────────────────────────────────────────
 # K 線切換 View
 # ────────────────────────────────────────────
 
@@ -56,8 +82,10 @@ class ChartView(discord.ui.View):
         await interaction.response.defer()
         try:
             chart_buf = generate_chart(
-                tf_data["hist"], self.data["code"],
-                self.data["name"], tf_data["price"],
+                tf_data["hist"],
+                self.data["code"],
+                self.data.get("display_name") or self.data.get("name"),
+                tf_data["price"],
             )
         except Exception:
             await interaction.followup.send("⚠️ 圖表產生失敗", ephemeral=True)
@@ -67,7 +95,7 @@ class ChartView(discord.ui.View):
         self._refresh_buttons()
         self.embed.set_footer(
             text=(
-                f"資料來源：Yahoo Finance｜Trader Camp Intelligence｜"
+                f"Yahoo Finance｜Trader Camp Intelligence｜"
                 f"非投資建議｜{self.TF_LABEL[tf_key]}"
             )
         )
@@ -100,7 +128,11 @@ bot = commands.Bot(command_prefix=Config.COMMAND_PREFIX, intents=intents, help_c
 # ────────────────────────────────────────────
 
 async def handle_stock_query(ctx: commands.Context, code: str) -> None:
-    query = code.strip()
+    query = (code or "").strip()
+
+    if not query:
+        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+        return
 
     if not query.isdigit():
         resolved = find_code_by_name(query)
@@ -117,8 +149,12 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
             await ctx.send(f"❌ 查無股票代號 `{code}`，請確認代號是否正確")
             return
 
+        data["display_name"] = _resolve_chinese_name(data, code)
+
         try:
-            chart_buf = generate_chart(data["hist"], data["code"], data["name"], data["price"])
+            chart_buf = generate_chart(
+                data["hist"], data["code"], data["display_name"], data["price"]
+            )
         except Exception as e:
             logger.error("圖表產生失敗: %s", e)
             await ctx.send("⚠️ 資料源暫時無法取得，請稍後再試")
@@ -132,39 +168,62 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
 
 
 def _build_embed(data: dict, trade: dict) -> discord.Embed:
+    display_name = data.get("display_name") or _resolve_chinese_name(data)
     embed = discord.Embed(
         title=(
-            f"{trade['title_icon']} {data['name']} {data['code']}"
+            f"{trade['title_icon']} {display_name} {data['code']}"
             f"｜{trade['status']}"
         ),
         description=(
-            f"現價：{trade['price_line']}\n"
-            f"評級：**{trade['rating']}**｜{trade['tagline']}"
+            f"{trade['price_line']}\n"
+            f"趨勢：**{trade['trend_rating']}**｜買點：**{trade['entry_rating']}**"
         ),
         color=trade["color"],
     )
-    embed.add_field(name="🎯 結論",    value=trade["conclusion"],  inline=False)
-    embed.add_field(name="🧩 劇本",    value=trade["scenario"],    inline=False)
-    embed.add_field(name="🧭 週期",    value=trade["cycles"],      inline=False)
-    embed.add_field(name="📐 關鍵價",  value=trade["key_levels"],  inline=False)
-    embed.add_field(name="📊 量價",    value=trade["volume"],      inline=False)
-    embed.add_field(name="🚦 交易計畫", value=trade["trade_plan"],  inline=False)
-    embed.add_field(name="📋 總結",    value=trade["summary"],     inline=False)
+    embed.add_field(name="🎯 一句話", value=trade["headline"], inline=False)
+    embed.add_field(name="🧩 劇本", value=trade["scenario"], inline=False)
+    embed.add_field(name="📍 位置", value=trade["position"], inline=False)
+    embed.add_field(name="🚦 計畫", value=trade["trade_plan"], inline=False)
+    embed.add_field(name="📊 補充", value=trade["extra"], inline=False)
     embed.set_image(url="attachment://chart.png")
-    embed.set_footer(
-        text="資料來源：Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜日K"
-    )
+    embed.set_footer(text="Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜日K")
     return embed
 
 
 # ────────────────────────────────────────────
-# 指令
+# 新指令：/K<股票代號或公司名稱>
+# ────────────────────────────────────────────
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    content = (message.content or "").strip()
+    lower = content.lower()
+
+    # 支援：/K2330、/K 2330、/k台積電、/k 台積電
+    if lower.startswith("/k"):
+        query = content[2:].strip()
+        if not query:
+            await message.channel.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+            return
+        ctx = await bot.get_context(message)
+        await handle_stock_query(ctx, query)
+        return
+
+    # 舊的 !股 / !查 / !k 指令保留，避免既有使用者突然不能用。
+    await bot.process_commands(message)
+
+
+# ────────────────────────────────────────────
+# 舊指令保留
 # ────────────────────────────────────────────
 
 @bot.command(name="股")
 async def cmd_stock(ctx: commands.Context, code: str = None):
     if not code:
-        await ctx.send("請輸入股票代號，例如：`!股 2330`")
+        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
         return
     await handle_stock_query(ctx, code)
 
@@ -172,7 +231,7 @@ async def cmd_stock(ctx: commands.Context, code: str = None):
 @bot.command(name="查")
 async def cmd_query(ctx: commands.Context, code: str = None):
     if not code:
-        await ctx.send("請輸入股票代號，例如：`!查 2330`")
+        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
         return
     await handle_stock_query(ctx, code)
 
@@ -180,7 +239,7 @@ async def cmd_query(ctx: commands.Context, code: str = None):
 @bot.command(name="k")
 async def cmd_kline(ctx: commands.Context, code: str = None):
     if not code:
-        await ctx.send("請輸入股票代號，例如：`!k 2330`")
+        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
         return
     await handle_stock_query(ctx, code)
 
@@ -189,32 +248,31 @@ async def cmd_kline(ctx: commands.Context, code: str = None):
 async def cmd_help(ctx: commands.Context):
     embed = discord.Embed(
         title="📖 台股查詢指令",
-        description="Trader Camp Intelligence — 凱衛風格台股查詢機器人",
+        description="Trader Camp Intelligence — 台股波段決策卡片",
         color=0x64D2FF,
     )
     embed.add_field(
         name="🔍 查詢指令",
         value=(
-            "`!股 2330` — 查詢股票\n"
-            "`!查 2330` — 查詢股票\n"
-            "`!k 2330`  — 產生 K 線圖\n"
-            "`!help`    — 顯示此說明"
+            "`/K2330` — 用股票代號查詢\n"
+            "`/K台積電` — 用公司名稱查詢\n"
+            "`/K 台達電` — 中間有空格也可以"
         ),
         inline=False,
     )
     embed.add_field(
-        name="📌 支援格式",
-        value="股票代號（如 `2330`）或公司名稱（如 `台積電`）",
+        name="📌 顯示內容",
+        value="一句話｜劇本｜位置｜計畫｜補充，主畫面只留關鍵價位。",
         inline=False,
     )
     embed.add_field(
         name="🎯 評級說明",
-        value="A 可做　B/B- 等修復/觀察　C 觀望/反彈觀察　D 避開",
+        value="趨勢評級看強弱；買點評級看現在適不適合進場。",
         inline=False,
     )
     embed.add_field(
-        name="📐 技術指標",
-        value="🟡 MA5 短期　🟠 MA20 中期　🔵 MA60 長期\n🔴 紅K上漲　🟢 綠K下跌（台股慣例）",
+        name="📐 圖表",
+        value="日K / 60分K / 5分K 按鈕可切換。",
         inline=False,
     )
     embed.set_footer(text="Trader Camp Intelligence Bot｜非投資建議")
