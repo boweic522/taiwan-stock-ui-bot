@@ -10,7 +10,14 @@ from __future__ import annotations
 import math
 from typing import Optional, Any
 
-from price_action import detect_price_action_context
+from price_action import (
+    detect_price_action_context,
+    detect_intraday_reversal_setup,
+    detect_market_structure,
+    detect_gap_context,
+    detect_multi_cycle_key_levels,
+    detect_three_candle_entry_setup,
+)
 
 
 # ────────────────────────────────────────────
@@ -176,6 +183,14 @@ def _is_high_risk_selloff(data: dict, d_label: str, h_label: str, pa_event: str)
     return both_weak and (big_selloff or black_event)
 
 
+def _intraday_valid(intraday: Optional[dict]) -> bool:
+    return bool(intraday and intraday.get("valid"))
+
+
+def _intraday_watch(intraday: Optional[dict]) -> bool:
+    return bool(intraday and intraday.get("watch"))
+
+
 # ────────────────────────────────────────────
 # 3. 交易狀態 / 趨勢評級
 # ────────────────────────────────────────────
@@ -243,7 +258,7 @@ def _determine_status(
 
     if status == "可做":
         icon, color = "🟢", 0xFF3B30
-    elif status in ("等修復", "觀察", "反彈觀察"):
+    elif status in ("等修復", "觀察", "反彈觀察", "試多觀察"):
         icon, color = "🟡", 0xFFD60A
     elif status == "避開":
         icon, color = "🔴", 0x8E8E93
@@ -291,7 +306,7 @@ def _fallback_20_low(data: dict) -> Optional[float]:
     return None
 
 
-def build_position_summary(data: dict, pa: dict) -> dict:
+def build_position_summary(data: dict, pa: dict, intraday: Optional[dict] = None, keymap: Optional[dict] = None, gap: Optional[dict] = None, three: Optional[dict] = None) -> dict:
     """只挑主畫面最重要三個價位：防守、修復、壓力。"""
     price = _num(data.get("price"))
     low = _num(data.get("low")) or _fallback_20_low(data)
@@ -302,14 +317,45 @@ def build_position_summary(data: dict, pa: dict) -> dict:
     key_low = _num(pa.get("key_low"))
     key_high = _num(pa.get("key_high"))
     pa_event = pa.get("event", "")
+    keymap = keymap or {}
+    gap = gap or {}
+    three = three or {}
 
-    if pa_event.startswith("長紅") and key_low is not None:
+    km_dead_pressure = _num(keymap.get("dead_pressure"))
+    km_dead_support = _num(keymap.get("dead_support"))
+    km_wave60_high = _num(keymap.get("wave60_high"))
+    km_wave60_low = _num(keymap.get("wave60_low"))
+    km_attack5_high = _num(keymap.get("attack5_high"))
+    km_defense5_low = _num(keymap.get("defense5_low"))
+    gap_low = _num(gap.get("gap_low"))
+    gap_high = _num(gap.get("gap_high"))
+    three_side = three.get("side")
+
+    if three.get("valid") and three_side == "long":
+        defense_label, defense = "三根K防守", _num(three.get("defense_price"))
+        repair_label, repair = "三根K觸發", _num(three.get("trigger_price"))
+    elif _intraday_valid(intraday):
+        defense_label, defense = "5分紅K低", _num(intraday.get("defense_price"))
+        repair_label, repair = "5分均線", _num(intraday.get("trigger_price"))
+    elif gap.get("event") == "跳空向上缺口" and gap_low is not None:
+        defense_label, defense = "缺口下緣", gap_low
+    elif pa_event.startswith("長紅") and key_low is not None:
         defense_label, defense = "劇本低", key_low
+    elif km_wave60_low is not None and price is not None and km_wave60_low < price:
+        defense_label, defense = "60K波低", km_wave60_low
+    elif km_defense5_low is not None and price is not None and km_defense5_low < price:
+        defense_label, defense = "5K防守", km_defense5_low
+    elif km_dead_support is not None and price is not None and km_dead_support < price:
+        defense_label, defense = "前低", km_dead_support
     else:
         defense_label, defense = "今日低", low
 
-    # 修復價：弱勢時優先看短均；短均不存在才看今日高。
-    if price is not None and ma5 is not None and ma5 > price:
+    # 修復價：弱勢時優先看短均；有5分/三根K試多時使用觸發價。
+    if (three.get("valid") and three_side == "long") or _intraday_valid(intraday):
+        pass
+    elif gap.get("event") == "跳空向下缺口" and gap_high is not None and price is not None and gap_high > price:
+        repair_label, repair = "缺口上緣", gap_high
+    elif price is not None and ma5 is not None and ma5 > price:
         repair_label, repair = "短均", ma5
     elif price is not None and high is not None and high > price:
         repair_label, repair = "今日高", high
@@ -321,6 +367,10 @@ def build_position_summary(data: dict, pa: dict) -> dict:
     pressure_label, pressure = _nearest_above(
         price,
         [
+            ("5K攻擊", km_attack5_high),
+            ("60K波高", km_wave60_high),
+            ("前高", km_dead_pressure),
+            ("缺口上緣", gap_high),
             ("中均", ma20),
             ("季線", ma60),
             ("劇本壓力", key_high),
@@ -332,7 +382,7 @@ def build_position_summary(data: dict, pa: dict) -> dict:
     if repair is not None and pressure is not None:
         if abs(pressure - repair) / max(abs(repair), 1.0) < 0.005:
             alternatives: list[tuple[str, float]] = []
-            for label, val in [("中均", ma20), ("季線", ma60), ("劇本壓力", key_high), ("今日高", high)]:
+            for label, val in [("5K攻擊", km_attack5_high), ("60K波高", km_wave60_high), ("前高", km_dead_pressure), ("缺口上緣", gap_high), ("中均", ma20), ("季線", ma60), ("劇本壓力", key_high), ("今日高", high)]:
                 v = _num(val)
                 if price is not None and v is not None and v > price:
                     if abs(v - repair) / max(abs(repair), 1.0) >= 0.005:
@@ -376,7 +426,7 @@ def _range_pct(data: dict, n: int = 10) -> Optional[float]:
         return None
 
 
-def _entry_score(data: dict, d_label: str, h_label: str, status: str, position: dict) -> int:
+def _entry_score(data: dict, d_label: str, h_label: str, status: str, position: dict, intraday: Optional[dict] = None) -> int:
     price = _num(data.get("price"))
     ma5 = _num(data.get("ma5"))
     ma20 = _num(data.get("ma20"))
@@ -428,6 +478,10 @@ def _entry_score(data: dict, d_label: str, h_label: str, status: str, position: 
         score -= 4
     if d_label == "偏空" and h_label == "偏空":
         score -= 2
+    if _intraday_valid(intraday) and status != "避開":
+        score += 3
+    elif _intraday_watch(intraday) and status != "避開":
+        score += 1
     if status == "避開":
         score -= 3
 
@@ -448,7 +502,7 @@ def _entry_rating(score: int) -> tuple[str, str]:
 # 6. 文案組裝
 # ────────────────────────────────────────────
 
-def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: str, data: dict, position: dict) -> str:
+def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: str, data: dict, position: dict, intraday: Optional[dict] = None) -> str:
     high_risk = _is_high_risk_selloff(data, d_label, h_label, pa_event)
     repair = fmt_price(position.get("repair"))
 
@@ -456,6 +510,10 @@ def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: s
         if m_label in ("短線反彈", "偏多"):
             return f"放量長黑後仍偏弱，5分反彈只視為跌深反抽。\n未收復 {repair} 前，先不低接。"
         return f"空方仍主導，反彈先視為修正。\n未收復 {repair} 前，先不低接。"
+    if _intraday_valid(intraday):
+        return "5分空排後紅K低點未破，短線空方壓力鬆動。\n這是小倉試單，不是波段確認。"
+    if _intraday_watch(intraday):
+        return "5分紅K低點暫時守住，但還沒完成站回。\n先觀察觸發價，不急著追。"
     if status == "可做":
         return "多週期結構偏多，趨勢仍有延續。\n避免追高，回踩守住再看。"
     if status in ("等修復", "觀察"):
@@ -465,7 +523,12 @@ def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: s
     return "週期訊號不一致，先等方向。\n有位置再做，沒位置就放過。"
 
 
-def _scenario_compact(pa: dict, status: str) -> str:
+def _scenario_compact(pa: dict, status: str, intraday: Optional[dict] = None) -> str:
+    if _intraday_valid(intraday) and status != "避開":
+        return "5分空排後紅K低點未破，且重新站上均線組。\n短線可列入試多觀察，但仍需60分確認。"
+    if _intraday_watch(intraday) and status != "避開":
+        return "5分空排後紅K低點暫時守住。\n尚未完成站回均線組，先等觸發。"
+
     event = pa.get("event", "一般結構")
     if event == "長黑後持續弱勢":
         return "長黑後弱勢延續，空方仍主導。\n反彈需先收復修復價，否則只是修正。"
@@ -484,13 +547,40 @@ def _scenario_compact(pa: dict, status: str) -> str:
     return "近期沒有明確關鍵K棒。\n主要依週期、位置與量能判斷。"
 
 
-def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str) -> str:
+def _three_long(three: Optional[dict]) -> bool:
+    return bool(three and three.get("valid") and three.get("side") == "long")
+
+
+def _three_short(three: Optional[dict]) -> bool:
+    return bool(three and three.get("valid") and three.get("side") == "short")
+
+
+def _structure_text(structure: Optional[dict]) -> str:
+    if not structure:
+        return "盤型：資料不足"
+    return f"盤型：{structure.get('pattern', '資料不足')}"
+
+
+def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str, intraday: Optional[dict] = None, three: Optional[dict] = None) -> str:
     defense = fmt_price(position.get("defense"))
     repair = fmt_price(position.get("repair"))
     pressure = fmt_price(position.get("pressure"))
     pa_event = pa.get("event", "")
+    three = three or {}
 
-    if status == "避開":
+    if _three_long(three) and status != "避開":
+        observe = f"三根K防守 {defense} 是否守住"
+        entry = f"站回/突破 {repair} 小倉試單"
+        invalid = f"跌破 {defense} 立即失效"
+    elif _three_short(three):
+        observe = f"三根K偏空壓力 {defense} 是否被收復"
+        entry = "不做多；等重新站回修復價"
+        invalid = f"站回 {repair} 且60分轉強再重評"
+    elif _intraday_valid(intraday) and status != "避開":
+        observe = f"5分紅K低點 {defense} 是否守住"
+        entry = f"站上 {repair} 後小倉試單"
+        invalid = f"跌破 {defense} 立即失效"
+    elif status == "避開":
         observe = f"能否守住 {defense}"
         entry = f"站回 {repair}，且60分轉強"
         invalid = f"跌破 {defense} 且續放量"
@@ -514,8 +604,18 @@ def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str)
     return f"觀察：{observe}\n進場：{entry}\n失敗：{invalid}"
 
 
-def _extra(d_label: str, h_label: str, m_label: str, data: dict) -> str:
-    return f"{build_compact_cycle_text(d_label, h_label, m_label)}\n量能：{compact_volume_text(data)}"
+def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optional[dict] = None, structure: Optional[dict] = None, three: Optional[dict] = None) -> str:
+    lines = [build_compact_cycle_text(d_label, h_label, m_label)]
+    lines.append(f"{_structure_text(structure)}｜量能：{compact_volume_text(data)}")
+    if _three_long(three):
+        lines.append("訊號：三根K試多")
+    elif _three_short(three):
+        lines.append("訊號：三根K偏空")
+    elif _intraday_valid(intraday):
+        lines.append("觸發：5分試多")
+    elif _intraday_watch(intraday):
+        lines.append("觀察：5分紅K低點")
+    return "\n".join(lines)
 
 
 # ────────────────────────────────────────────
@@ -539,20 +639,66 @@ def build_trade_view(data: dict) -> dict:
 
     pa = detect_price_action_context(data)
     pa_event = pa.get("event", "一般結構")
+    intraday = detect_intraday_reversal_setup(data)
+    structure = detect_market_structure(data)
+    gap = detect_gap_context(data)
+    keymap = detect_multi_cycle_key_levels(data)
+    three = detect_three_candle_entry_setup(data)
 
     status, trend_rating, tagline, title_icon, color = _determine_status(
         d_score, h_score, m_score, m_label, pa_event, data, d_label, h_label
     )
 
-    position = build_position_summary(data, pa)
-    entry_score = _entry_score(data, d_label, h_label, status, position)
+    high_risk = _is_high_risk_selloff(data, d_label, h_label, pa_event)
+    if _intraday_valid(intraday) and not high_risk and status in ("反彈觀察", "觀望", "等待方向", "等修復", "觀察"):
+        status, trend_rating, tagline = "試多觀察", "C", "5分空排失效，限小倉"
+        title_icon, color = "🟡", 0xFFD60A
+
+    if _three_long(three) and not high_risk and status in ("反彈觀察", "觀望", "等待方向", "等修復", "觀察", "試多觀察"):
+        status, trend_rating, tagline = "試多觀察", "C", "三根K成立，限小倉"
+        title_icon, color = "🟡", 0xFFD60A
+    elif _three_short(three) and status in ("反彈觀察", "觀望", "等待方向", "等修復"):
+        status, trend_rating, tagline = "避開", "D", "三根K偏空，先不做多"
+        title_icon, color = "🔴", 0x8E8E93
+
+    position = build_position_summary(
+        data,
+        pa,
+        intraday if (_intraday_valid(intraday) and not high_risk) else None,
+        keymap=keymap,
+        gap=gap,
+        three=three if not high_risk else None,
+    )
+    entry_score = _entry_score(data, d_label, h_label, status, position, intraday if not high_risk else None)
+    if _three_long(three) and not high_risk:
+        entry_score += 3
+    if gap.get("event") == "跳空向上缺口" and gap.get("valid") and not high_risk:
+        entry_score += 2
+    if structure.get("pattern") in ("多頭整理盤", "多頭反轉盤") and status != "避開":
+        entry_score += 1
     entry_rating, entry_tagline = _entry_rating(entry_score)
 
     price_line = _price_line(data.get("price"), data.get("change"), data.get("change_pct"))
-    headline = _headline(status, d_label, h_label, m_label, pa_event, data, position)
-    scenario = _scenario_compact(pa, status)
-    trade_plan = _trade_plan(status, data, pa, position, h_label)
-    extra = _extra(d_label, h_label, m_label, data)
+    headline = _headline(status, d_label, h_label, m_label, pa_event, data, position, intraday if not high_risk else None)
+    if _three_long(three) and not high_risk:
+        headline = "5分三根K完成：反轉、表態、確認。\n屬於小倉試單，不是波段確認。"
+    elif _three_short(three):
+        headline = "5分三根K偏空確認，短線賣壓占優。\n未重新站回修復價前，不做多。"
+    elif gap.get("event") == "跳空向上缺口" and gap.get("valid"):
+        headline = "跳空缺口未補，屬於強表態。\n等回測缺口或5分轉強，不追高。"
+
+    scenario = _scenario_compact(pa, status, intraday if not high_risk else None)
+    if _three_long(three) and not high_risk:
+        scenario = f"三根K進場法成立：{three.get('reading')}\n仍需看60分是否跟上。"
+    elif _three_short(three):
+        scenario = f"三根K偏空：{three.get('reading')}\n短線先避開多單。"
+    elif gap.get("event") != "無明顯缺口" and gap.get("reading"):
+        scenario = f"{gap.get('reading')}\n{scenario.splitlines()[0]}"
+    elif structure.get("pattern") in ("多頭整理盤", "空頭整理盤"):
+        scenario = f"{structure.get('pattern')}：{structure.get('reading')}\n等待關鍵位表態。"
+
+    trade_plan = _trade_plan(status, data, pa, position, h_label, intraday if not high_risk else None, three if not high_risk else None)
+    extra = _extra(d_label, h_label, m_label, data, intraday if not high_risk else None, structure, three if not high_risk else None)
 
     return {
         "status": status,
@@ -570,6 +716,11 @@ def build_trade_view(data: dict) -> dict:
         "position": position["text"],
         "trade_plan": trade_plan,
         "extra": extra,
+        "intraday_setup": intraday,
+        "market_structure": structure,
+        "gap_context": gap,
+        "key_levels_map": keymap,
+        "three_candle_setup": three,
         # 舊 key 保留，避免其他地方還有引用時爆掉。
         "rating": trend_rating,
         "conclusion": headline,
