@@ -2,6 +2,7 @@
 trade_view.py
 波段交易判斷層。不 import discord。
 整合資料層、price_action、多週期判斷，輸出 UI 可用 dict。
+新版重點：主畫面少數字、重位置、重買點品質。
 """
 
 from __future__ import annotations
@@ -27,29 +28,41 @@ def _num(value: Any) -> Optional[float]:
     return None if math.isnan(f) else f
 
 
-def _fmt(value: Optional[float]) -> str:
-    return "資料不足" if value is None else f"{value:.2f}"
+def fmt_price(value: Any) -> str:
+    """壓縮價格顯示，避免 Discord 主畫面數字太吵。"""
+    v = _num(value)
+    if v is None:
+        return "資料不足"
+    av = abs(v)
+    if av >= 1000:
+        return f"{v:.0f}"
+    if av >= 100:
+        return f"{v:.1f}".rstrip("0").rstrip(".")
+    return f"{v:.2f}"
 
 
-def _unique_levels(levels: list[tuple[str, Optional[float]]], price: Optional[float] = None,
-                   side: str = "any") -> list[str]:
-    """去除過近價位，避免同一個價位重複塞爆 UI。"""
-    out: list[str] = []
-    seen: list[float] = []
-    for label, val in levels:
-        v = _num(val)
-        if v is None:
-            continue
-        if side == "above" and price is not None and v <= price:
-            continue
-        if side == "below" and price is not None and v >= price:
-            continue
-        # 用 0.5% 當作去重門檻，比固定 0.5 元更適合不同股價級距
-        if any(abs(v - s) / max(abs(s), 1.0) < 0.005 for s in seen):
-            continue
-        seen.append(v)
-        out.append(f"{label} {v:.2f}")
-    return out
+def fmt_pct(value: Any, *, show_sign: bool = False) -> str:
+    v = _num(value)
+    if v is None:
+        return "資料不足"
+    if show_sign and v > 0:
+        return f"+{v:.1f}%"
+    return f"{v:.1f}%"
+
+
+def _pct_distance(price: Optional[float], level: Optional[float]) -> Optional[float]:
+    if price is None or level is None or price == 0:
+        return None
+    return (level - price) / price * 100
+
+
+def _clean_label(label: str) -> str:
+    return {
+        "短線反彈": "反彈",
+        "短線轉弱": "轉弱",
+        "中性偏多": "偏多",
+        "資料不足": "不足",
+    }.get(label, label)
 
 
 # ────────────────────────────────────────────
@@ -108,13 +121,76 @@ def _tf_label(d: Optional[dict]) -> str:
     return "震盪"
 
 
+def build_compact_cycle_text(d_label: str, h_label: str, m_label: str) -> str:
+    return (
+        f"週期：日K{_clean_label(d_label)}｜"
+        f"60分{_clean_label(h_label)}｜"
+        f"5分{_clean_label(m_label)}"
+    )
+
+
 # ────────────────────────────────────────────
-# 2. 交易狀態
+# 2. 量價 / 風控
 # ────────────────────────────────────────────
 
-def _determine_status(d_score: int, h_score: int, m_score: int,
-                      m_label: str, pa_event: str) -> tuple[str, str, str, str, int]:
-    """回傳 (status, rating, tagline, title_icon, color)。"""
+def _volume_meta(data: dict) -> tuple[float, str, str]:
+    volume = _num(data.get("volume")) or 0.0
+    avg_volume = _num(data.get("avg_volume")) or 0.0
+    change_pct = _num(data.get("change_pct")) or 0.0
+
+    ratio = volume / avg_volume if avg_volume > 0 else 1.0
+    tag = "放量" if ratio >= 1.5 else ("量縮" if ratio <= 0.7 else "量平")
+
+    up = change_pct > 0.5
+    down = change_pct < -0.5
+
+    if up and ratio >= 1.5:
+        reading = "多方攻擊"
+    elif up and ratio <= 0.7:
+        reading = "反彈量弱"
+    elif down and ratio >= 1.5:
+        reading = "賣壓明確"
+    elif down and ratio <= 0.7:
+        reading = "承接不足"
+    elif ratio >= 1.5:
+        reading = "換手明顯"
+    elif ratio <= 0.7:
+        reading = "市場觀望"
+    else:
+        reading = "量能普通"
+
+    return ratio, tag, reading
+
+
+def compact_volume_text(data: dict) -> str:
+    ratio, tag, reading = _volume_meta(data)
+    return f"{tag} {ratio:.1f}x｜{reading}"
+
+
+def _is_high_risk_selloff(data: dict, d_label: str, h_label: str, pa_event: str) -> bool:
+    change_pct = _num(data.get("change_pct")) or 0.0
+    ratio, _, _ = _volume_meta(data)
+    both_weak = d_label == "偏空" and h_label == "偏空"
+    big_selloff = change_pct <= -5 and ratio >= 1.5
+    black_event = pa_event in ("長黑後持續弱勢", "長黑後待觀察") and change_pct <= -3 and ratio >= 1.2
+    return both_weak and (big_selloff or black_event)
+
+
+# ────────────────────────────────────────────
+# 3. 交易狀態 / 趨勢評級
+# ────────────────────────────────────────────
+
+def _determine_status(
+    d_score: int,
+    h_score: int,
+    m_score: int,
+    m_label: str,
+    pa_event: str,
+    data: dict,
+    d_label: str,
+    h_label: str,
+) -> tuple[str, str, str, str, int]:
+    """回傳 (status, trend_rating, tagline, title_icon, color)。"""
     if d_score < 0 or h_score < 0:
         return "等待方向", "C", "資料不足，先不硬判斷", "⚫", 0x8E8E93
 
@@ -129,39 +205,41 @@ def _determine_status(d_score: int, h_score: int, m_score: int,
 
     m_bullish = m_score >= 3 or m_label in ("偏多", "短線反彈")
 
-    # ── 基礎規則：日K決定方向，60分決定能否執行，5分只作切入參考 ──
     if d_bull and h_bull:
-        status, rating, tagline = "可做", "A", "趨勢延續，順勢觀察"
+        status, rating, tagline = "可做", "A", "趨勢延續"
     elif d_bull and h_chop:
-        status, rating, tagline = "等修復", "B", "大方向尚可，等60分轉強"
+        status, rating, tagline = "等修復", "B", "大方向尚可"
     elif d_bull and h_bear:
-        status, rating, tagline = "等修復", "C+", "日線未壞，但波段節奏未修復"
+        status, rating, tagline = "等修復", "C+", "波段節奏未修復"
     elif (d_neut or d_chop) and h_bull:
-        status, rating, tagline = "觀察", "B-", "短線轉強，但日線方向未明"
+        status, rating, tagline = "觀察", "B-", "短線轉強"
     elif (d_neut or d_chop) and h_bear:
-        status, rating, tagline = "觀望", "C", "多空拉鋸，等方向"
+        status, rating, tagline = "觀望", "C", "多空拉鋸"
     elif d_bear and h_bear and m_bullish:
         status, rating, tagline = "反彈觀察", "C", "短線反彈，不追價"
     elif d_bear and h_bear and not m_bullish:
-        status, rating, tagline = "避開", "D", "空方主導，避免逆勢"
+        status, rating, tagline = "避開", "D", "空方主導"
     else:
-        status, rating, tagline = "等待方向", "C", "週期不一致，先等確認"
+        status, rating, tagline = "等待方向", "C", "週期不一致"
 
-    # ── price_action 加權調整：只微調，不讓單一K棒凌駕週期結構 ──
     if pa_event == "長紅後回測低點不破":
         if status == "觀望" and not h_bear:
-            status, rating, tagline = "觀察", "B-", "回測不破，等60分確認"
+            status, rating, tagline = "觀察", "B-", "回測不破，等確認"
     elif pa_event == "長紅後跌破低點":
         if status in ("可做", "觀察", "等修復"):
-            status, rating, tagline = "觀望", "C", "跌破長紅低點，結構轉弱"
+            status, rating, tagline = "觀望", "C", "長紅低點失效"
         if h_bear:
-            status, rating, tagline = "避開", "D", "跌破長紅低點且60分偏空"
+            status, rating, tagline = "避開", "D", "長紅失效且60分偏空"
     elif pa_event == "長紅後跌破又收回":
         if rating in ("A", "B", "C+"):
-            status, rating, tagline = "觀察", "B-", "跌破後收回，需量能與60分確認"
+            status, rating, tagline = "觀察", "B-", "跌破收回，待確認"
     elif pa_event == "長黑後持續弱勢":
         if status in ("可做", "觀察"):
-            status, rating, tagline = "等修復", "C+", "長黑壓制，需修復結構"
+            status, rating, tagline = "等修復", "C+", "長黑壓制"
+
+    # 風控優先權：放量大跌 + 日/60弱，不讓5分反彈拉高狀態。
+    if _is_high_risk_selloff(data, d_label, h_label, pa_event):
+        status, rating, tagline = "避開", "D", "放量長黑，空方主導"
 
     if status == "可做":
         icon, color = "🟢", 0xFF3B30
@@ -176,175 +254,272 @@ def _determine_status(d_score: int, h_score: int, m_score: int,
 
 
 # ────────────────────────────────────────────
-# 3. 價格顯示
+# 4. 價格 / 位置
 # ────────────────────────────────────────────
 
-def _price_line(price: Optional[float], change: Optional[float], change_pct: Optional[float]) -> str:
-    price = _num(price)
-    change = _num(change) or 0.0
-    change_pct = _num(change_pct) or 0.0
-    if price is None:
+def _price_line(price: Any, change: Any, change_pct: Any) -> str:
+    p = _num(price)
+    c = _num(change) or 0.0
+    pct = _num(change_pct) or 0.0
+    if p is None:
         return "資料不足"
-    if change > 0:
-        return f"{price:.2f} ▲ +{change:.2f}（+{change_pct:.2f}%）"
-    if change < 0:
-        return f"{price:.2f} ▼ {change:.2f}（{change_pct:.2f}%）"
-    return f"{price:.2f} ─ 0.00（0.00%）"
+    if c > 0:
+        return f"{fmt_price(p)} ▲ {fmt_pct(abs(pct))}"
+    if c < 0:
+        return f"{fmt_price(p)} ▼ {fmt_pct(abs(pct))}"
+    return f"{fmt_price(p)} ─ 0.0%"
 
 
-# ────────────────────────────────────────────
-# 4. 關鍵價
-# ────────────────────────────────────────────
+def _nearest_above(price: Optional[float], candidates: list[tuple[str, Optional[float]]]) -> tuple[str, Optional[float]]:
+    valid: list[tuple[str, float]] = []
+    for label, val in candidates:
+        v = _num(val)
+        if price is not None and v is not None and v > price:
+            valid.append((label, v))
+    if not valid:
+        return "前高", None
+    return min(valid, key=lambda x: x[1])
 
-def _key_levels(data: dict, pa: dict) -> str:
+
+def _fallback_20_low(data: dict) -> Optional[float]:
+    hist = data.get("hist")
+    if hist is not None and len(hist) >= 5:
+        try:
+            return float(hist["Low"].tail(20).min())
+        except Exception:
+            return None
+    return None
+
+
+def build_position_summary(data: dict, pa: dict) -> dict:
+    """只挑主畫面最重要三個價位：防守、修復、壓力。"""
     price = _num(data.get("price"))
-    low = _num(data.get("low"))
+    low = _num(data.get("low")) or _fallback_20_low(data)
     high = _num(data.get("high"))
     ma5 = _num(data.get("ma5"))
     ma20 = _num(data.get("ma20"))
     ma60 = _num(data.get("ma60"))
-    hist = data.get("hist")
-
-    supports: list[tuple[str, Optional[float]]] = [("今日低", low)]
-    if pa.get("key_low") is not None:
-        supports.append(("劇本支撐", _num(pa.get("key_low"))))
-    if hist is not None and len(hist) >= 10:
-        try:
-            supports.append(("近20K低", float(hist["Low"].tail(20).min())))
-        except Exception:
-            pass
-
-    resistances: list[tuple[str, Optional[float]]] = [
-        ("MA5", ma5),
-        ("MA20", ma20),
-        ("今日高", high),
-        ("劇本壓力", _num(pa.get("key_high"))),
-    ]
-
-    support_parts = _unique_levels(supports, price, side="below") if price is not None else _unique_levels(supports)
-    resist_parts = _unique_levels(resistances, price, side="above") if price is not None else _unique_levels(resistances)
-
-    support_str = " / ".join(support_parts) if support_parts else "短線支撐不明"
-    resist_str = " / ".join(resist_parts) if resist_parts else "短壓較輕，觀察前高"
-
-    lines = [f"支撐：{support_str}", f"壓力：{resist_str}"]
-    if ma60 is not None and price is not None:
-        role = "支撐" if price > ma60 else "壓力"
-        lines.append(f"長線：MA60 {ma60:.2f}（{role}）")
-    return "\n".join(lines)
-
-
-# ────────────────────────────────────────────
-# 5. 量價
-# ────────────────────────────────────────────
-
-def _volume_reading(data: dict) -> str:
-    volume = int(data.get("volume") or 0)
-    avg_volume = int(data.get("avg_volume") or 0)
-    change_pct = _num(data.get("change_pct")) or 0.0
-
-    vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
-    vol_tag = "放量" if vol_ratio >= 1.5 else ("量縮" if vol_ratio <= 0.7 else "量平")
-
-    up = change_pct > 0.5
-    down = change_pct < -0.5
-
-    if up and vol_ratio >= 1.5:
-        reading = "多方主動攻擊"
-    elif up and vol_ratio <= 0.7:
-        reading = "反彈力道不足，追高小心"
-    elif down and vol_ratio >= 1.5:
-        reading = "賣壓明確，風險升高"
-    elif down and vol_ratio <= 0.7:
-        reading = "賣壓未擴大，但承接力不足"
-    elif vol_ratio >= 1.5:
-        reading = "換手明顯，等待方向確認"
-    elif vol_ratio <= 0.7:
-        reading = "市場觀望，缺乏方向性資金"
-    else:
-        reading = "量能普通，方向仍需價格確認"
-
-    return (
-        f"今日量：{volume:,}\n"
-        f"相對均量：{vol_ratio:.1f}x（{vol_tag}）\n"
-        f"判斷：{reading}"
-    )
-
-
-# ────────────────────────────────────────────
-# 6. 交易計畫（進場 + 失敗合併）
-# ────────────────────────────────────────────
-
-def _trade_plan(status: str, data: dict, pa: dict) -> str:
-    ma5 = _num(data.get("ma5"))
-    ma20 = _num(data.get("ma20"))
-    high = _num(data.get("high"))
-    low = _num(data.get("low"))
-    pa_event = pa.get("event", "")
     key_low = _num(pa.get("key_low"))
-
-    ma5_s = _fmt(ma5)
-    ma20_s = _fmt(ma20)
-    high_s = _fmt(high)
-    low_s = _fmt(low)
-
-    if pa_event == "長紅後回測低點不破" and key_low is not None:
-        entry = f"回測 {key_low:.2f} 不破，且5分轉強、60分不偏空，才列入試多觀察。"
-    elif pa_event == "長紅後跌破低點" and key_low is not None:
-        entry = f"不低接，需重新站回 {key_low:.2f} 才能重新觀察。"
-    elif status == "可做":
-        entry = f"回踩不破 MA5 {ma5_s} / MA20 {ma20_s}，或突破今日高 {high_s} 續強。"
-    elif status == "等修復":
-        entry = f"站回 MA5 {ma5_s}，且60分K轉為偏多。"
-    elif status == "反彈觀察":
-        entry = f"站回 MA5 {ma5_s}，且60分K不再偏空；未確認前不追價。"
-    elif status in ("觀望", "等待方向"):
-        entry = f"收盤站回 MA20 {ma20_s}，且日K與60分K方向一致後再評估。"
-    elif status == "觀察":
-        entry = f"回踩 MA5 {ma5_s} 不破，且日線方向確立後再介入。"
-    else:
-        entry = f"不建議進場。需先站回 MA5 {ma5_s} / MA20 {ma20_s} 並修復60分K。"
+    key_high = _num(pa.get("key_high"))
+    pa_event = pa.get("event", "")
 
     if pa_event.startswith("長紅") and key_low is not None:
-        invalid = f"跌破 {key_low:.2f} 且放量，劇本失效。"
-    elif low is not None:
-        invalid = f"跌破今日低 {low_s} 且放量，短線轉弱確認。"
+        defense_label, defense = "劇本低", key_low
+    else:
+        defense_label, defense = "今日低", low
+
+    # 修復價：弱勢時優先看短均；短均不存在才看今日高。
+    if price is not None and ma5 is not None and ma5 > price:
+        repair_label, repair = "短均", ma5
+    elif price is not None and high is not None and high > price:
+        repair_label, repair = "今日高", high
     elif ma5 is not None:
-        invalid = f"跌破 MA5 {ma5_s} 且無法收回，短線轉弱。"
+        repair_label, repair = "短均", ma5
     else:
-        invalid = "資料不足，暫不設定硬停損。"
+        repair_label, repair = "今日高", high
 
-    return f"進場：{entry}\n失敗：{invalid}"
+    pressure_label, pressure = _nearest_above(
+        price,
+        [
+            ("中均", ma20),
+            ("季線", ma60),
+            ("劇本壓力", key_high),
+            ("今日高", high),
+        ],
+    )
+
+    # 避免修復價與壓力價幾乎一樣，改取下一個較高壓力。
+    if repair is not None and pressure is not None:
+        if abs(pressure - repair) / max(abs(repair), 1.0) < 0.005:
+            alternatives: list[tuple[str, float]] = []
+            for label, val in [("中均", ma20), ("季線", ma60), ("劇本壓力", key_high), ("今日高", high)]:
+                v = _num(val)
+                if price is not None and v is not None and v > price:
+                    if abs(v - repair) / max(abs(repair), 1.0) >= 0.005:
+                        alternatives.append((label, v))
+            if alternatives:
+                pressure_label, pressure = min(alternatives, key=lambda x: x[1])
+
+    position = (
+        f"防守：{fmt_price(defense)}（{defense_label}）\n"
+        f"修復：{fmt_price(repair)}（{repair_label}）\n"
+        f"壓力：{fmt_price(pressure)}（{pressure_label}）"
+    )
+
+    return {
+        "defense": defense,
+        "defense_label": defense_label,
+        "repair": repair,
+        "repair_label": repair_label,
+        "pressure": pressure,
+        "pressure_label": pressure_label,
+        "text": position,
+    }
 
 
 # ────────────────────────────────────────────
-# 7. 結論 / 總結
+# 5. 買點評級
 # ────────────────────────────────────────────
 
-def _conclusion(status: str, d_label: str, h_label: str, m_label: str,
-                pa_event: str) -> str:
-    base = f"日線 {d_label}，60分 {h_label}，5分 {m_label}。\n當前研判：**{status}**"
-    if pa_event not in ("一般結構", "資料不足", ""):
-        base += f"\n劇本事件：{pa_event}"
-    return base
+def _range_pct(data: dict, n: int = 10) -> Optional[float]:
+    hist = data.get("hist")
+    if hist is None or len(hist) < n:
+        return None
+    try:
+        tail = hist.tail(n)
+        high = float(tail["High"].max())
+        low = float(tail["Low"].min())
+        if low <= 0:
+            return None
+        return (high - low) / low * 100
+    except Exception:
+        return None
 
 
-def _summary(status: str, rating: str, tagline: str) -> str:
+def _entry_score(data: dict, d_label: str, h_label: str, status: str, position: dict) -> int:
+    price = _num(data.get("price"))
+    ma5 = _num(data.get("ma5"))
+    ma20 = _num(data.get("ma20"))
+    ma60 = _num(data.get("ma60"))
+    change_pct = _num(data.get("change_pct")) or 0.0
+    ratio, tag, _ = _volume_meta(data)
+    defense = _num(position.get("defense"))
+    pressure = _num(position.get("pressure"))
+
+    score = 0
+    if price is not None and ma20 is not None:
+        dist20 = (price - ma20) / ma20 * 100
+        if -2 <= dist20 <= 5:
+            score += 2
+        elif dist20 > 10:
+            score -= 3
+    if price is not None and ma60 is not None:
+        dist60 = (price - ma60) / ma60 * 100
+        if 0 <= dist60 <= 8:
+            score += 1
+        elif dist60 < 0:
+            score -= 4
+    if tag == "量縮" and status != "避開":
+        score += 2
+    if _range_pct(data, 10) is not None and (_range_pct(data, 10) or 99) <= 12:
+        score += 2
+    if ma5 is not None and ma20 is not None and ma20 != 0:
+        if abs(ma5 - ma20) / ma20 * 100 <= 3:
+            score += 1
+    if price is not None and defense is not None and price > defense:
+        support_dist = (price - defense) / price * 100
+        if 0 <= support_dist <= 4:
+            score += 2
+        elif support_dist > 8:
+            score -= 2
+    if h_label in ("震盪", "短線反彈", "偏多"):
+        score += 1
+    if price is not None and defense is not None and pressure is not None and price > defense:
+        downside = price - defense
+        upside = pressure - price
+        if downside > 0 and upside > 0 and upside / downside >= 2:
+            score += 3
+        elif upside > 0 and upside / downside < 1:
+            score -= 2
+
+    if change_pct >= 5 and ratio >= 1.5:
+        score -= 2
+    if change_pct <= -5 and ratio >= 1.5:
+        score -= 4
+    if d_label == "偏空" and h_label == "偏空":
+        score -= 2
+    if status == "避開":
+        score -= 3
+
+    return score
+
+
+def _entry_rating(score: int) -> tuple[str, str]:
+    if score >= 10:
+        return "A", "買點佳"
+    if score >= 7:
+        return "B", "買點觀察"
+    if score >= 4:
+        return "C", "等待確認"
+    return "D", "不適合進場"
+
+
+# ────────────────────────────────────────────
+# 6. 文案組裝
+# ────────────────────────────────────────────
+
+def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: str, data: dict, position: dict) -> str:
+    high_risk = _is_high_risk_selloff(data, d_label, h_label, pa_event)
+    repair = fmt_price(position.get("repair"))
+
+    if high_risk or status == "避開":
+        if m_label in ("短線反彈", "偏多"):
+            return f"放量長黑後仍偏弱，5分反彈只視為跌深反抽。\n未收復 {repair} 前，先不低接。"
+        return f"空方仍主導，反彈先視為修正。\n未收復 {repair} 前，先不低接。"
     if status == "可做":
-        body = "可順勢觀察，但仍需照交易計畫執行，不追失控行情。"
-    elif status in ("等修復", "觀察"):
-        body = "條件接近但還沒完全成立，等確認比提早猜方向更划算。"
-    elif status == "反彈觀察":
-        body = "有反彈訊號，但波段結構未完整修復，先看別急著做。"
-    elif status == "避開":
-        body = "空方主導，先避開，別把低接當成勇敢。"
+        return "多週期結構偏多，趨勢仍有延續。\n避免追高，回踩守住再看。"
+    if status in ("等修復", "觀察"):
+        return f"趨勢沒有完全壞，但還不到舒服買點。\n先看能否站回 {repair}。"
+    if status == "反彈觀察":
+        return f"短線有反彈，但波段結構還沒修好。\n先等站回 {repair}，不要急著追。"
+    return "週期訊號不一致，先等方向。\n有位置再做，沒位置就放過。"
+
+
+def _scenario_compact(pa: dict, status: str) -> str:
+    event = pa.get("event", "一般結構")
+    if event == "長黑後持續弱勢":
+        return "長黑後弱勢延續，空方仍主導。\n反彈需先收復修復價，否則只是修正。"
+    if event == "長黑後反彈收復":
+        return "長黑後出現反彈，但還不是反轉。\n需要站穩修復價，才有重新評估價值。"
+    if event == "長紅後直接上攻":
+        return "長紅後動能延續，但尚未回測支撐。\n強歸強，買點不一定舒服。"
+    if event == "長紅後回測低點不破":
+        return "長紅後回測未破，支撐暫時有效。\n若60分轉強，可列入買點觀察。"
+    if event == "長紅後跌破低點":
+        return "長紅低點失守，原多方劇本失效。\n重新站回前，不低接。"
+    if event == "長紅後跌破又收回":
+        return "跌破長紅低點後收回，仍有防守。\n需量能與60分確認。"
+    if event == "資料不足":
+        return "K棒資料不足，先不硬判斷劇本。\n主要看週期與關鍵位置。"
+    return "近期沒有明確關鍵K棒。\n主要依週期、位置與量能判斷。"
+
+
+def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str) -> str:
+    defense = fmt_price(position.get("defense"))
+    repair = fmt_price(position.get("repair"))
+    pressure = fmt_price(position.get("pressure"))
+    pa_event = pa.get("event", "")
+
+    if status == "避開":
+        observe = f"能否守住 {defense}"
+        entry = f"站回 {repair}，且60分轉強"
+        invalid = f"跌破 {defense} 且續放量"
+    elif pa_event == "長紅後回測低點不破":
+        observe = f"回測不破 {defense}"
+        entry = "5分轉強，且60分不偏空"
+        invalid = f"跌破 {defense} 且放量"
+    elif status == "可做":
+        observe = f"回踩是否守住 {defense}"
+        entry = f"突破 {pressure} 或回踩守住後續強"
+        invalid = f"跌破 {defense} 且無法收回"
+    elif status in ("等修復", "反彈觀察", "觀察"):
+        observe = f"能否站回 {repair}"
+        entry = f"站回 {repair}，且60分轉強"
+        invalid = f"跌破 {defense} 且放量"
     else:
-        body = "週期訊號不一致，等待方向比硬交易更有性價比。"
-    return f"評級 {rating}｜{tagline}\n{body}"
+        observe = f"守 {defense}、攻 {repair}"
+        entry = "日K與60分方向一致後再評估"
+        invalid = f"跌破 {defense} 且放量"
+
+    return f"觀察：{observe}\n進場：{entry}\n失敗：{invalid}"
+
+
+def _extra(d_label: str, h_label: str, m_label: str, data: dict) -> str:
+    return f"{build_compact_cycle_text(d_label, h_label, m_label)}\n量能：{compact_volume_text(data)}"
 
 
 # ────────────────────────────────────────────
-# 8. 主函式
+# 7. 主函式
 # ────────────────────────────────────────────
 
 def build_trade_view(data: dict) -> dict:
@@ -365,31 +540,41 @@ def build_trade_view(data: dict) -> dict:
     pa = detect_price_action_context(data)
     pa_event = pa.get("event", "一般結構")
 
-    status, rating, tagline, title_icon, color = _determine_status(
-        d_score, h_score, m_score, m_label, pa_event
+    status, trend_rating, tagline, title_icon, color = _determine_status(
+        d_score, h_score, m_score, m_label, pa_event, data, d_label, h_label
     )
 
+    position = build_position_summary(data, pa)
+    entry_score = _entry_score(data, d_label, h_label, status, position)
+    entry_rating, entry_tagline = _entry_rating(entry_score)
+
     price_line = _price_line(data.get("price"), data.get("change"), data.get("change_pct"))
-    cycles = f"日K：{d_label}\n60分：{h_label}\n5分：{m_label}"
-    conclusion = _conclusion(status, d_label, h_label, m_label, pa_event)
-    scenario = pa.get("scenario") or "近期沒有明確關鍵K棒。\n主要依多週期、均線與量價判斷。"
-    key_levels = _key_levels(data, pa)
-    volume = _volume_reading(data)
-    trade_plan = _trade_plan(status, data, pa)
-    summary = _summary(status, rating, tagline)
+    headline = _headline(status, d_label, h_label, m_label, pa_event, data, position)
+    scenario = _scenario_compact(pa, status)
+    trade_plan = _trade_plan(status, data, pa, position, h_label)
+    extra = _extra(d_label, h_label, m_label, data)
 
     return {
         "status": status,
-        "rating": rating,
-        "tagline": tagline,
         "title_icon": title_icon,
         "color": color,
         "price_line": price_line,
-        "conclusion": conclusion,
+        "trend_rating": trend_rating,
+        "entry_rating": entry_rating,
+        "trend_text": f"趨勢：{trend_rating}",
+        "entry_text": f"買點：{entry_rating}",
+        "tagline": tagline,
+        "entry_tagline": entry_tagline,
+        "headline": headline,
         "scenario": scenario,
-        "cycles": cycles,
-        "key_levels": key_levels,
-        "volume": volume,
+        "position": position["text"],
         "trade_plan": trade_plan,
-        "summary": summary,
+        "extra": extra,
+        # 舊 key 保留，避免其他地方還有引用時爆掉。
+        "rating": trend_rating,
+        "conclusion": headline,
+        "cycles": build_compact_cycle_text(d_label, h_label, m_label),
+        "key_levels": position["text"],
+        "volume": compact_volume_text(data),
+        "summary": f"趨勢 {trend_rating}｜買點 {entry_rating}\n{tagline}｜{entry_tagline}",
     }
