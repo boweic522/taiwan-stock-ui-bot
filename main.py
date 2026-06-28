@@ -2,10 +2,16 @@ import discord
 from discord.ext import commands
 import logging
 import sys
-from config import Config
-from stock_data import get_stock_data, get_trend, get_mtf_ma_analysis, get_detailed_reading, get_mtf_summary, find_code_by_name
-from chart import generate_chart
 
+from config import Config
+from stock_data import get_stock_data, find_code_by_name
+from chart import generate_chart
+from trade_view import build_trade_view
+
+
+# ────────────────────────────────────────────
+# K 線切換 View
+# ────────────────────────────────────────────
 
 class ChartView(discord.ui.View):
     TF_LABEL = {"1d": "日K", "60m": "60分K", "5m": "5分K"}
@@ -22,7 +28,10 @@ class ChartView(discord.ui.View):
             if isinstance(child, discord.ui.Button):
                 is_current = child.custom_id == self.current_tf
                 child.disabled = is_current
-                child.style = discord.ButtonStyle.primary if is_current else discord.ButtonStyle.secondary
+                child.style = (
+                    discord.ButtonStyle.primary if is_current
+                    else discord.ButtonStyle.secondary
+                )
 
     @discord.ui.button(label="日K", custom_id="1d")
     async def btn_daily(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -45,7 +54,6 @@ class ChartView(discord.ui.View):
             return
 
         await interaction.response.defer()
-
         try:
             chart_buf = generate_chart(
                 tf_data["hist"], self.data["code"],
@@ -58,15 +66,22 @@ class ChartView(discord.ui.View):
         self.current_tf = tf_key
         self._refresh_buttons()
         self.embed.set_footer(
-            text=f"資料來源：Yahoo Finance　|　Trader Camp Intelligence　|　{self.TF_LABEL[tf_key]}"
+            text=(
+                f"資料來源：Yahoo Finance｜Trader Camp Intelligence｜"
+                f"非投資建議｜{self.TF_LABEL[tf_key]}"
+            )
         )
         self.embed.set_image(url="attachment://chart.png")
-
         await interaction.message.edit(
             embed=self.embed,
             attachments=[discord.File(chart_buf, filename="chart.png")],
             view=self,
         )
+
+
+# ────────────────────────────────────────────
+# Bot 設定
+# ────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,14 +92,16 @@ logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix=Config.COMMAND_PREFIX, intents=intents, help_command=None)
 
+
+# ────────────────────────────────────────────
+# 核心查詢
+# ────────────────────────────────────────────
 
 async def handle_stock_query(ctx: commands.Context, code: str) -> None:
     query = code.strip()
 
-    # 若輸入非純數字，嘗試用公司名稱反查代號
     if not query.isdigit():
         resolved = find_code_by_name(query)
         if resolved is None:
@@ -107,45 +124,42 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
             await ctx.send("⚠️ 資料源暫時無法取得，請稍後再試")
             return
 
-    trend = get_trend(data["price"], data["ma5"], data["ma20"], data["ma60"])
-    mtf_ma = get_mtf_ma_analysis(data["tf"])
-    detailed = get_detailed_reading(data["change_pct"], data["price"], data["ma5"], data["ma20"], data["ma60"], data["volume"], data["avg_volume"])
-    summary = get_mtf_summary(data["tf"], data["price"], data["ma5"], data["ma20"], data["ma60"], data["change_pct"])
-
-    is_up = data["change"] >= 0
-    color = 0xFF3B30 if is_up else 0x30D158
-    arrow = "▲" if is_up else "▼"
-    sign = "+" if is_up else ""
-
-    embed = discord.Embed(
-        title=f"{'🔴' if is_up else '🟢'} {data['name']}　({data['code']})",
-        color=color,
-    )
-    embed.add_field(
-        name="💰 最新價格",
-        value=f"**`{data['price']:.2f}`**　{arrow} {sign}{data['change']:.2f}　（{sign}{data['change_pct']:.2f}%）",
-        inline=False,
-    )
-    embed.add_field(name="📈 今日最高", value=f"`{data['high']:.2f}`", inline=True)
-    embed.add_field(name="📉 今日最低", value=f"`{data['low']:.2f}`", inline=True)
-    embed.add_field(name="📊 成交量", value=f"`{data['volume']:,}`", inline=True)
-    embed.add_field(name="🟡 MA5", value=f"`{data['ma5']:.2f}`", inline=True)
-    embed.add_field(name="🟠 MA20", value=f"`{data['ma20']:.2f}`", inline=True)
-    embed.add_field(
-        name="🔵 MA60",
-        value=f"`{data['ma60']:.2f}`" if data["ma60"] else "`資料不足`",
-        inline=True,
-    )
-    embed.add_field(name="🧭 趨勢", value=f"**{trend}**", inline=False)
-    embed.add_field(name="📐 各週期均線關係", value=mtf_ma, inline=False)
-    embed.add_field(name="💬 詳細判讀", value=detailed, inline=False)
-    embed.add_field(name="📋 收斂總結", value=summary, inline=False)
-    embed.set_image(url="attachment://chart.png")
-    embed.set_footer(text="資料來源：Yahoo Finance　|　Trader Camp Intelligence　|　日K")
+        trade = build_trade_view(data)
+        embed = _build_embed(data, trade)
 
     view = ChartView(data, embed)
     await ctx.send(embed=embed, file=discord.File(chart_buf, filename="chart.png"), view=view)
 
+
+def _build_embed(data: dict, trade: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title=(
+            f"{trade['title_icon']} {data['name']} {data['code']}"
+            f"｜{trade['status']}"
+        ),
+        description=(
+            f"現價：{trade['price_line']}\n"
+            f"評級：**{trade['rating']}**｜{trade['tagline']}"
+        ),
+        color=trade["color"],
+    )
+    embed.add_field(name="🎯 結論",    value=trade["conclusion"],  inline=False)
+    embed.add_field(name="🧩 劇本",    value=trade["scenario"],    inline=False)
+    embed.add_field(name="🧭 週期",    value=trade["cycles"],      inline=False)
+    embed.add_field(name="📐 關鍵價",  value=trade["key_levels"],  inline=False)
+    embed.add_field(name="📊 量價",    value=trade["volume"],      inline=False)
+    embed.add_field(name="🚦 交易計畫", value=trade["trade_plan"],  inline=False)
+    embed.add_field(name="📋 總結",    value=trade["summary"],     inline=False)
+    embed.set_image(url="attachment://chart.png")
+    embed.set_footer(
+        text="資料來源：Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜日K"
+    )
+    return embed
+
+
+# ────────────────────────────────────────────
+# 指令
+# ────────────────────────────────────────────
 
 @bot.command(name="股")
 async def cmd_stock(ctx: commands.Context, code: str = None):
@@ -181,26 +195,35 @@ async def cmd_help(ctx: commands.Context):
     embed.add_field(
         name="🔍 查詢指令",
         value=(
-            "`!股 2330` — 查詢台積電\n"
-            "`!查 2330` — 查詢台積電\n"
-            "`!k 2330` — 產生 K 線圖\n"
-            "`!help` — 顯示此說明"
+            "`!股 2330` — 查詢股票\n"
+            "`!查 2330` — 查詢股票\n"
+            "`!k 2330`  — 產生 K 線圖\n"
+            "`!help`    — 顯示此說明"
         ),
         inline=False,
     )
     embed.add_field(
-        name="📌 常用代號",
-        value="`2330` 台積電　`0050` 元大台灣50\n`2317` 鴻海　`2454` 聯發科　`2382` 廣達",
+        name="📌 支援格式",
+        value="股票代號（如 `2330`）或公司名稱（如 `台積電`）",
         inline=False,
     )
     embed.add_field(
-        name="📐 技術指標說明",
+        name="🎯 評級說明",
+        value="A 可做　B/B- 等修復/觀察　C 觀望/反彈觀察　D 避開",
+        inline=False,
+    )
+    embed.add_field(
+        name="📐 技術指標",
         value="🟡 MA5 短期　🟠 MA20 中期　🔵 MA60 長期\n🔴 紅K上漲　🟢 綠K下跌（台股慣例）",
         inline=False,
     )
-    embed.set_footer(text="Trader Camp Intelligence Bot")
+    embed.set_footer(text="Trader Camp Intelligence Bot｜非投資建議")
     await ctx.send(embed=embed)
 
+
+# ────────────────────────────────────────────
+# 事件
+# ────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
