@@ -164,23 +164,30 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
 
         data["display_name"] = data.get("display_name") or _resolve_chinese_name(data, code)
 
+        chart_buf = None
+        chart_ok = False
         try:
-            chart_buf = generate_chart(
-                data["hist"], data["code"], data["display_name"], data["price"]
-            )
+            hist = data.get("hist")
+            if hist is not None and not getattr(hist, "empty", True):
+                chart_buf = generate_chart(
+                    hist, data["code"], data["display_name"], data["price"]
+                )
+                chart_ok = True
         except Exception as e:
-            logger.error("圖表產生失敗: %s", e)
-            await ctx.send("⚠️ 資料源暫時無法取得，請稍後再試")
-            return
+            # 大盤 / 期貨資料源偶爾沒有完整 K 線；文字卡仍可先回覆。
+            logger.warning("圖表產生失敗，改送文字卡: %s", e)
 
         trade = build_trade_view(data)
-        embed = _build_embed(data, trade)
+        embed = _build_embed(data, trade, has_chart=chart_ok)
 
-    view = ChartView(data, embed)
-    await ctx.send(embed=embed, file=discord.File(chart_buf, filename="chart.png"), view=view)
+    if chart_ok and chart_buf is not None:
+        view = ChartView(data, embed)
+        await ctx.send(embed=embed, file=discord.File(chart_buf, filename="chart.png"), view=view)
+    else:
+        await ctx.send(embed=embed)
 
 
-def _build_embed(data: dict, trade: dict) -> discord.Embed:
+def _build_embed(data: dict, trade: dict, has_chart: bool = True) -> discord.Embed:
     display_name = data.get("display_name") or _resolve_chinese_name(data)
     embed = discord.Embed(
         title=(
@@ -198,8 +205,12 @@ def _build_embed(data: dict, trade: dict) -> discord.Embed:
     embed.add_field(name="📍 位置", value=trade["position"], inline=False)
     embed.add_field(name="🚦 計畫", value=trade["trade_plan"], inline=False)
     embed.add_field(name="📊 補充", value=trade["extra"], inline=False)
-    embed.set_image(url="attachment://chart.png")
-    embed.set_footer(text="Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜日K")
+    if has_chart:
+        embed.set_image(url="attachment://chart.png")
+        footer_tf = "日K"
+    else:
+        footer_tf = "文字卡"
+    embed.set_footer(text=f"Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜{footer_tf}")
     return embed
 
 
