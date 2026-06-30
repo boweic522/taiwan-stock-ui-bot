@@ -604,6 +604,14 @@ def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str,
     return f"觀察：{observe}\n進場：{entry}\n失敗：{invalid}"
 
 
+def _quote_text(data: dict) -> str:
+    quality = str(data.get("quote_quality") or "Yahoo Finance報價").strip()
+    note = str(data.get("quote_note") or "").strip()
+    if note:
+        return f"報價：{quality}｜{note}"
+    return f"報價：{quality}"
+
+
 def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optional[dict] = None, structure: Optional[dict] = None, three: Optional[dict] = None) -> str:
     lines = [build_compact_cycle_text(d_label, h_label, m_label)]
     lines.append(f"{_structure_text(structure)}｜量能：{compact_volume_text(data)}")
@@ -615,6 +623,7 @@ def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optio
         lines.append("觸發：5分試多")
     elif _intraday_watch(intraday):
         lines.append("觀察：5分紅K低點")
+    lines.append(_quote_text(data))
     return "\n".join(lines)
 
 
