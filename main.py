@@ -7,6 +7,8 @@ from config import Config
 from stock_data import get_stock_data, find_code_by_name
 from chart import generate_chart
 from trade_view import build_trade_view
+from market_data import get_special_market_data, is_special_market_query
+from realtime_quote import patch_realtime_quote
 
 
 # ────────────────────────────────────────────
@@ -131,25 +133,36 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
     query = (code or "").strip()
 
     if not query:
-        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+        await ctx.send("請輸入股票代號、公司名稱或大盤項目，例如：`/K2330`、`/K台積電`、`/K加權`")
         return
 
-    if not query.isdigit():
-        resolved = find_code_by_name(query)
-        if resolved is None:
-            await ctx.send(f"❌ 找不到「{query}」，請確認公司名稱或股票代號")
-            return
-        code = resolved
-    else:
-        code = query.upper()
-
     async with ctx.typing():
-        data = get_stock_data(code)
-        if data is None:
-            await ctx.send(f"❌ 查無股票代號 `{code}`，請確認代號是否正確")
-            return
+        # 特殊市場項目：加權 / 櫃買 / 小台
+        if is_special_market_query(query):
+            data = get_special_market_data(query)
+            if data is None:
+                await ctx.send(f"❌ `{query}` 資料暫時無法取得，請稍後再試")
+                return
+            code = str(data.get("code") or query)
+        else:
+            if not query.isdigit():
+                resolved = find_code_by_name(query)
+                if resolved is None:
+                    await ctx.send(f"❌ 找不到「{query}」，請確認公司名稱或股票代號")
+                    return
+                code = resolved
+            else:
+                code = query.upper()
 
-        data["display_name"] = _resolve_chinese_name(data, code)
+            data = get_stock_data(code)
+            if data is None:
+                await ctx.send(f"❌ 查無股票代號 `{code}`，請確認代號是否正確")
+                return
+
+            data["display_name"] = _resolve_chinese_name(data, code)
+            data = patch_realtime_quote(data, code)
+
+        data["display_name"] = data.get("display_name") or _resolve_chinese_name(data, code)
 
         try:
             chart_buf = generate_chart(
@@ -223,7 +236,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="股")
 async def cmd_stock(ctx: commands.Context, code: str = None):
     if not code:
-        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+        await ctx.send("請輸入股票代號、公司名稱或大盤項目，例如：`/K2330`、`/K台積電`、`/K加權`")
         return
     await handle_stock_query(ctx, code)
 
@@ -231,7 +244,7 @@ async def cmd_stock(ctx: commands.Context, code: str = None):
 @bot.command(name="查")
 async def cmd_query(ctx: commands.Context, code: str = None):
     if not code:
-        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+        await ctx.send("請輸入股票代號、公司名稱或大盤項目，例如：`/K2330`、`/K台積電`、`/K加權`")
         return
     await handle_stock_query(ctx, code)
 
@@ -239,7 +252,7 @@ async def cmd_query(ctx: commands.Context, code: str = None):
 @bot.command(name="k")
 async def cmd_kline(ctx: commands.Context, code: str = None):
     if not code:
-        await ctx.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+        await ctx.send("請輸入股票代號、公司名稱或大盤項目，例如：`/K2330`、`/K台積電`、`/K加權`")
         return
     await handle_stock_query(ctx, code)
 
@@ -262,7 +275,7 @@ async def cmd_help(ctx: commands.Context):
     )
     embed.add_field(
         name="📌 顯示內容",
-        value="一句話｜劇本｜位置｜計畫｜補充；整合三週期、盤型、關鍵位與三根K。",
+        value="一句話｜劇本｜位置｜計畫｜補充；支援個股、加權、櫃買、小台。",
         inline=False,
     )
     embed.add_field(
