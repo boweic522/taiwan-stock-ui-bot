@@ -41,8 +41,9 @@ def fmt_price(value: Any) -> str:
     if v is None:
         return "資料不足"
     av = abs(v)
+    # 高價股/指數加千分位，價格區塊會更容易掃讀。
     if av >= 1000:
-        return f"{v:.0f}"
+        return f"{v:,.0f}"
     if av >= 100:
         return f"{v:.1f}".rstrip("0").rstrip(".")
     return f"{v:.2f}"
@@ -279,10 +280,10 @@ def _price_line(price: Any, change: Any, change_pct: Any) -> str:
     if p is None:
         return "資料不足"
     if c > 0:
-        return f"{fmt_price(p)} ▲ {fmt_pct(abs(pct))}"
+        return f"{fmt_price(p)} ▲ +{fmt_price(c)}（{fmt_pct(pct, show_sign=True)}）"
     if c < 0:
-        return f"{fmt_price(p)} ▼ {fmt_pct(abs(pct))}"
-    return f"{fmt_price(p)} ─ 0.0%"
+        return f"{fmt_price(p)} ▼ -{fmt_price(abs(c))}（{fmt_pct(pct)}）"
+    return f"{fmt_price(p)} ─ 0（0.0%）"
 
 
 def _nearest_above(price: Optional[float], candidates: list[tuple[str, Optional[float]]]) -> tuple[str, Optional[float]]:
@@ -489,37 +490,149 @@ def _entry_score(data: dict, d_label: str, h_label: str, status: str, position: 
 
 
 def _entry_rating(score: int) -> tuple[str, str]:
-    if score >= 10:
+    # 買點評級：新版重點是位置，不讓強勢股自動拿高買點。
+    if score >= 11:
         return "A", "買點佳"
+    if score >= 9:
+        return "A-", "買點佳但需確認"
     if score >= 7:
+        return "B+", "買點觀察"
+    if score >= 5:
         return "B", "買點觀察"
-    if score >= 4:
+    if score >= 3:
         return "C", "等待確認"
     return "D", "不適合進場"
 
 
 def _chase_risk(data: dict, position: dict, gap: Optional[dict] = None) -> str:
-    """追價風險：用距離防守、漲幅、缺口未回測來壓制追價衝動。"""
+    """追價風險：強勢可參與，但離防守太遠的新倉不是好買點。"""
     price = _num(data.get("price"))
     change_pct = _num(data.get("change_pct")) or 0.0
     defense = _num(position.get("defense"))
     ratio, _, _ = _volume_meta(data)
     risk = 0
-    if price is not None and defense is not None and price > 0:
+    dist = None
+    if price is not None and defense is not None and price > 0 and price > defense:
         dist = (price - defense) / price * 100
-        if dist > 8:
+        if dist > 9:
+            risk += 3
+        elif dist > 6:
             risk += 2
-        elif dist > 4:
+        elif dist > 3.5:
             risk += 1
-    if change_pct >= 5:
+    if change_pct >= 6:
+        risk += 3 if ratio >= 1.3 else 2
+    elif change_pct >= 4:
         risk += 2 if ratio >= 1.3 else 1
+    elif change_pct >= 2.5 and dist is not None and dist > 5:
+        risk += 1
     if gap and gap.get("event") == "跳空向上缺口" and gap.get("valid"):
         risk += 1
-    if risk >= 3:
+    if risk >= 4:
         return "高"
-    if risk >= 1:
+    if risk >= 2:
         return "中"
     return "低"
+
+
+
+
+def _level_distance_pct(data: dict, position: dict) -> Optional[float]:
+    price = _num(data.get("price"))
+    defense = _num(position.get("defense"))
+    if price is None or defense is None or price <= 0 or price <= defense:
+        return None
+    return (price - defense) / price * 100
+
+
+def _is_trend_strong(d_label: str, h_label: str, status: str, trend_rating: str) -> bool:
+    return status == "可做" or trend_rating in ("A", "A-", "B+") or (d_label == "偏多" and h_label in ("偏多", "短線反彈", "震盪"))
+
+
+def _is_strong_but_bad_entry(data: dict, status: str, trend_rating: str, d_label: str, h_label: str, pa: dict, gap: dict, position: dict, chase: str) -> bool:
+    """強勢但不好買：趨勢歸趨勢，買點歸買點。"""
+    if not _is_trend_strong(d_label, h_label, status, trend_rating):
+        return False
+    pa_event = pa.get("event", "")
+    change_pct = _num(data.get("change_pct")) or 0.0
+    dist = _level_distance_pct(data, position)
+    strong_expression = pa_event == "長紅後直接上攻" or (gap.get("event") == "跳空向上缺口" and gap.get("valid")) or change_pct >= 4
+    far_from_defense = dist is not None and dist >= 4.5
+    return chase == "高" or (strong_expression and far_from_defense)
+
+
+def _is_supported_entry_setup(pa: dict, structure: dict, h_label: str) -> bool:
+    """好買點：回測不破、整理守住、風險可控。"""
+    if h_label == "偏空":
+        return False
+    if pa.get("event") == "長紅後回測低點不破":
+        return True
+    if structure.get("pattern") in ("多頭整理盤", "多頭反轉盤"):
+        return True
+    return False
+
+
+def _apply_oldwu_decision(*, status: str, trend_rating: str, tagline: str, title_icon: str, color: int, entry_score: int, data: dict, pa: dict, gap: dict, structure: dict, position: dict, intraday: Optional[dict], three: Optional[dict], d_label: str, h_label: str, m_label: str, high_risk: bool) -> dict:
+    """老吳邏輯主審層：風險否決 → 表態/追價 → 防守買點 → 5K試單 → 多週期。"""
+    reasons: list[str] = []
+    chase = _chase_risk(data, position, gap)
+    stage = "等待"
+    decision = "base"
+    pa_event = pa.get("event", "")
+    if high_risk:
+        status, trend_rating, tagline = "避開", "D", "放量長黑，空方主導"
+        title_icon, color = "🔴", 0x8E8E93
+        entry_score = min(entry_score, 0) - 6
+        stage = "失效"
+        decision = "risk_veto"
+        reasons.append("風險否決：日K/60分偏弱且放量下跌，5K反彈不採信。")
+    elif _three_short(three) or pa_event == "長紅後跌破低點":
+        status, trend_rating, tagline = "避開", "D", "多方劇本失效"
+        title_icon, color = "🔴", 0x8E8E93
+        entry_score = min(entry_score, 1) - 5
+        stage = "失效"
+        decision = "invalidated"
+        reasons.append("失效優先：關鍵K低點或三根K偏空成立，先不做多。")
+    elif _is_strong_but_bad_entry(data, status, trend_rating, d_label, h_label, pa, gap, position, chase):
+        status = "等待回測"
+        tagline = "趨勢強，但買點不舒服"
+        title_icon, color = "🟡", 0xFFD60A
+        entry_score = min(entry_score, 4)
+        stage = "等待"
+        decision = "wait_pullback"
+        reasons.append("強弱與買點分離：趨勢偏強，但離防守太遠或跳空/長紅後未回測。")
+        if trend_rating == "C":
+            trend_rating = "B"
+    elif _is_supported_entry_setup(pa, structure, h_label):
+        status = "試單觀察"
+        tagline = "防守有效，試單觀察"
+        title_icon, color = "🟡", 0xFFD60A
+        entry_score = max(entry_score + 3, 7)
+        stage = "試單"
+        decision = "supported_entry"
+        reasons.append("防守優先：回測不破或整理守支撐，位置比追價舒服。")
+    elif _three_long(three) and not high_risk:
+        status, trend_rating, tagline = "試多觀察", "C+", "三根K成立，限小倉"
+        title_icon, color = "🟡", 0xFFD60A
+        entry_score = max(entry_score + 3, 7)
+        stage = "試單"
+        decision = "three_candle_long"
+        reasons.append("進場觸發：5K三根K成立，只定義小倉試單，不等於波段確認。")
+    elif _intraday_valid(intraday) and not high_risk:
+        status, trend_rating, tagline = "試多觀察", "C+", "5分空排失效，限小倉"
+        title_icon, color = "🟡", 0xFFD60A
+        entry_score = max(entry_score + 3, 7)
+        stage = "試單"
+        decision = "intraday_reversal"
+        reasons.append("進場觸發：5K紅K低點未破且站回均線，先視為試單。")
+    elif status == "可做" and h_label == "偏多" and m_label == "偏多" and chase == "低":
+        stage = "持有"
+        decision = "trend_hold"
+        reasons.append("趨勢延續：60K與5K同步偏多，追價風險低。")
+    else:
+        stage = _operation_stage(status, data, pa, position, intraday, three, gap, d_label, h_label, m_label)
+        reasons.append("未觸發主審覆蓋，維持多週期與位置判斷。")
+    return {"status": status, "trend_rating": trend_rating, "tagline": tagline, "title_icon": title_icon, "color": color, "entry_score": entry_score, "stage": stage, "chase": chase, "decision": decision, "reasons": reasons}
 
 
 def _operation_stage(status: str, data: dict, pa: dict, position: dict, intraday: Optional[dict], three: Optional[dict], gap: Optional[dict], d_label: str, h_label: str, m_label: str) -> str:
@@ -553,31 +666,47 @@ def _footer_meta(data: dict) -> str:
     return "｜".join(parts)
 
 
-def _detail_text(data: dict, pa: dict, gap: dict, structure: dict, keymap: dict, intraday: dict, three: dict, chase: str, d_label: str, h_label: str, m_label: str) -> str:
-    """詳細模式用，不放在精簡卡。"""
+def _detail_text(data: dict, pa: dict, gap: dict, structure: dict, keymap: dict, intraday: dict, three: dict, chase: str, d_label: str, h_label: str, m_label: str, stage: str = "等待", decision: str = "base") -> str:
+    """詳細模式：重點不是更多作文，而是把觸發器與主審結果攤開。"""
+    def _yes_no(flag) -> str:
+        return "已觸發" if flag else "未觸發"
+    gap_event = gap.get("event", "無明顯缺口")
+    gap_state = "未補/有效" if gap.get("valid") else ("已回補/失效" if gap_event != "無明顯缺口" else "無")
+    pa_event = pa.get("event", "一般結構")
+    intraday_event = intraday.get("event", "無盤中試多訊號") if intraday else "無盤中試多訊號"
+    three_event = three.get("event", "三根K未成形") if three else "三根K未成形"
     lines = [
+        "觸發器診斷：",
+        f"跳空：{gap_event}｜{gap_state}",
+        f"K棒劇本：{pa_event}",
+        f"5K試多：{_yes_no(bool(intraday and intraday.get('valid')))}｜{intraday_event}",
+        f"三根K：{_yes_no(bool(three and three.get('valid')))}｜{three_event}",
+        f"追價風險：{chase}",
+        f"操作階段：{stage}",
+        f"主審結果：{decision}",
+        "",
         f"三週期：日K{_clean_label(d_label)}｜60分{_clean_label(h_label)}｜5分{_clean_label(m_label)}",
-        f"盤型：{structure.get('pattern', '資料不足')}｜追價：{chase}",
+        f"盤型：{structure.get('pattern', '資料不足')}｜{structure.get('reading', '')}",
     ]
-    if gap.get("event") != "無明顯缺口":
-        lines.append(f"跳空：{gap.get('event')}｜{gap.get('reading', '')}")
-    if pa.get("event") not in ("一般結構", "資料不足", ""):
-        lines.append(f"K棒：{pa.get('event')}｜{pa.get('reading', '')}")
-    if intraday.get("event") not in ("無盤中試多訊號", "5分資料不足", ""):
-        lines.append(f"5K：{intraday.get('event')}｜{intraday.get('reading', '')}")
-    if three.get("event"):
-        lines.append(f"三根K：{three.get('event')}｜{three.get('reading', '')}")
+    trigger_readings = []
+    if gap.get("reading"):
+        trigger_readings.append(f"跳空：{gap.get('reading')}")
+    if pa.get("reading") and pa_event not in ("一般結構", "資料不足"):
+        trigger_readings.append(f"K棒：{pa.get('reading')}")
+    if intraday and intraday.get("reading") and intraday_event not in ("無盤中試多訊號", "5分資料不足"):
+        trigger_readings.append(f"5K：{intraday.get('reading')}")
+    if three and three.get("reading") and three_event != "三根K未成形":
+        trigger_readings.append(f"三根K：{three.get('reading')}")
+    if trigger_readings:
+        lines.append("")
+        lines.extend(trigger_readings[:4])
     km = []
-    for key, label in [
-        ("dead_pressure", "前高"), ("dead_support", "前低"),
-        ("wave60_high", "60K波高"), ("wave60_low", "60K波低"),
-        ("attack5_high", "5K攻擊"), ("defense5_low", "5K防守"),
-    ]:
+    for key, label in [("dead_pressure", "前高"), ("dead_support", "前低"), ("wave60_high", "60K波高"), ("wave60_low", "60K波低"), ("attack5_high", "5K攻擊"), ("defense5_low", "5K防守")]:
         if keymap.get(key) is not None:
             km.append(f"{label}{fmt_price(keymap.get(key))}")
     if km:
         lines.append("關鍵位：" + "｜".join(km[:6]))
-    return "\n".join([line for line in lines if line.strip()])
+    return "\n".join([line for line in lines if str(line).strip()])
 
 
 # ────────────────────────────────────────────
@@ -588,6 +717,8 @@ def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: s
     high_risk = _is_high_risk_selloff(data, d_label, h_label, pa_event)
     repair = fmt_price(position.get("repair"))
 
+    if status == "等待回測":
+        return "趨勢很強，但距離防守價太遠。\n這裡不是舒服買點，等回測或5分重新整理。"
     if high_risk or status == "避開":
         if m_label in ("短線反彈", "偏多"):
             return f"放量長黑後仍偏弱，5分反彈只視為跌深反抽。\n未收復 {repair} 前，先不低接。"
@@ -606,6 +737,8 @@ def _headline(status: str, d_label: str, h_label: str, m_label: str, pa_event: s
 
 
 def _scenario_compact(pa: dict, status: str, intraday: Optional[dict] = None) -> str:
+    if status == "等待回測":
+        return "表態仍有效，但尚未回測防守。\n強歸強，買點不一定舒服。"
     if _intraday_valid(intraday) and status != "避開":
         return "5分空排後紅K低點未破，且重新站上均線組。\n短線可列入試多觀察，但仍需60分確認。"
     if _intraday_watch(intraday) and status != "避開":
@@ -650,7 +783,11 @@ def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str,
     pa_event = pa.get("event", "")
     three = three or {}
 
-    if _three_long(three) and status != "避開":
+    if status == "等待回測":
+        observe = f"回測是否守住 {defense}"
+        entry = f"5K整理後再突破 {repair}"
+        invalid = f"跌破 {defense}，表態失效"
+    elif _three_long(three) and status != "避開":
         observe = f"三根K防守 {defense} 是否守住"
         entry = f"站回/突破 {repair} 小倉試單"
         invalid = f"跌破 {defense} 立即失效"
@@ -690,7 +827,9 @@ def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optio
     lines = [build_compact_cycle_text(d_label, h_label, m_label)]
     lines.append(f"{_structure_text(structure)}｜量能：{compact_volume_text(data)}")
     lines.append(f"階段：{stage}｜追價：{chase}")
-    if _three_long(three):
+    if stage == "等待" and chase == "高":
+        lines.append("提示：強勢不追，等回測")
+    elif _three_long(three):
         lines.append("訊號：三根K試多")
     elif _three_short(three):
         lines.append("訊號：三根K偏空")
@@ -752,20 +891,49 @@ def build_trade_view(data: dict) -> dict:
         gap=gap,
         three=three if not high_risk else None,
     )
+
     entry_score = _entry_score(data, d_label, h_label, status, position, intraday if not high_risk else None)
     if _three_long(three) and not high_risk:
         entry_score += 3
     if gap.get("event") == "跳空向上缺口" and gap.get("valid") and not high_risk:
-        entry_score += 2
-    if structure.get("pattern") in ("多頭整理盤", "多頭反轉盤") and status != "避開":
         entry_score += 1
+    if structure.get("pattern") in ("多頭整理盤", "多頭反轉盤") and status != "避開":
+        entry_score += 2
+
+    decision = _apply_oldwu_decision(
+        status=status,
+        trend_rating=trend_rating,
+        tagline=tagline,
+        title_icon=title_icon,
+        color=color,
+        entry_score=entry_score,
+        data=data,
+        pa=pa,
+        gap=gap,
+        structure=structure,
+        position=position,
+        intraday=intraday if not high_risk else None,
+        three=three if not high_risk else None,
+        d_label=d_label,
+        h_label=h_label,
+        m_label=m_label,
+        high_risk=high_risk,
+    )
+    status = decision["status"]
+    trend_rating = decision["trend_rating"]
+    tagline = decision["tagline"]
+    title_icon = decision["title_icon"]
+    color = decision["color"]
+    entry_score = decision["entry_score"]
+    stage = decision["stage"]
+    chase = decision["chase"]
     entry_rating, entry_tagline = _entry_rating(entry_score)
-    chase = _chase_risk(data, position, gap)
-    stage = _operation_stage(status, data, pa, position, intraday if not high_risk else None, three if not high_risk else None, gap, d_label, h_label, m_label)
 
     price_line = _price_line(data.get("price"), data.get("change"), data.get("change_pct"))
     headline = _headline(status, d_label, h_label, m_label, pa_event, data, position, intraday if not high_risk else None)
-    if _three_long(three) and not high_risk:
+    if status == "等待回測":
+        pass
+    elif _three_long(three) and not high_risk:
         headline = "5分三根K完成：反轉、表態、確認。\n屬於小倉試單，不是波段確認。"
     elif _three_short(three):
         headline = "5分三根K偏空確認，短線賣壓占優。\n未重新站回修復價前，不做多。"
@@ -773,7 +941,9 @@ def build_trade_view(data: dict) -> dict:
         headline = "跳空缺口未補，屬於強表態。\n等回測缺口或5分轉強，不追高。"
 
     scenario = _scenario_compact(pa, status, intraday if not high_risk else None)
-    if _three_long(three) and not high_risk:
+    if status == "等待回測":
+        scenario = "表態有效，但尚未回測防守。\n追價風險偏高，新倉先等位置。"
+    elif _three_long(three) and not high_risk:
         scenario = f"三根K進場法成立：{three.get('reading')}\n仍需看60分是否跟上。"
     elif _three_short(three):
         scenario = f"三根K偏空：{three.get('reading')}\n短線先避開多單。"
@@ -784,7 +954,17 @@ def build_trade_view(data: dict) -> dict:
 
     trade_plan = _trade_plan(status, data, pa, position, h_label, intraday if not high_risk else None, three if not high_risk else None)
     extra = _extra(d_label, h_label, m_label, data, intraday if not high_risk else None, structure, three if not high_risk else None, chase, stage)
-    detail = _detail_text(data, pa, gap, structure, keymap, intraday if not high_risk else {}, three if not high_risk else {}, chase, d_label, h_label, m_label)
+    detail = _detail_text(
+        data, pa, gap, structure, keymap,
+        intraday if not high_risk else {},
+        three if not high_risk else {},
+        chase, d_label, h_label, m_label,
+        stage=stage,
+        decision=decision.get("decision", "base"),
+    )
+    if decision.get("reasons"):
+        reason_text = "\n".join(f"・{r}" for r in decision.get("reasons", []))
+        detail = detail + "\n\n主審原因：\n" + reason_text
     footer_meta = _footer_meta(data)
 
     return {
