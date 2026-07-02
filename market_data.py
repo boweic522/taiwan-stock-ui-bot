@@ -42,13 +42,13 @@ SPECIAL_MARKETS: dict[str, dict[str, Any]] = {
     "tpex": {"display_name": "櫃買指數", "code": "^TWOII", "symbol": "^TWOII", "asset_type": "index", "quote_url": "https://tw.stock.yahoo.com/quote/%5ETWOII"},
 
     # 小型台指近一。K 線暫用加權作為技術結構參考；即時價抓 Yahoo 期貨頁。
-    "小台": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
-    "小台指": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
-    "小台指近一": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
-    "小型台指": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
-    "mtx": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
-    "wmt": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
-    "wmt&": {"display_name": "小台指近一", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台即時報價；K線結構暫以加權指數代理"},
+    "小台": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
+    "小台指": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
+    "小型臺指期貨近月": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
+    "小型台指": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
+    "mtx": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
+    "wmt": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
+    "wmt&": {"display_name": "小型臺指期貨近月", "code": "WMT&", "symbol": "^TWII", "asset_type": "future", "future_symbol": "WMT&", "quote_url": "https://tw.stock.yahoo.com/future/WMT%26", "proxy_note": "小台＝小型臺指期貨近月；K線結構暫以加權指數代理"},
 }
 
 
@@ -193,6 +193,45 @@ def _synthetic_hist(quote: dict[str, Any]) -> pd.DataFrame:
     )
 
 
+def _patch_latest_candle(hist: pd.DataFrame, quote: dict[str, Any]) -> pd.DataFrame:
+    """用報價頁最新價校正最後一根 K，讓大盤/小台文字判斷更接近即時。"""
+    if hist is None or hist.empty or not quote:
+        return hist
+    price = _num(quote.get("price"))
+    if price is None:
+        return hist
+    high = _num(quote.get("high")) or price
+    low = _num(quote.get("low")) or price
+    try:
+        df = hist.copy()
+        idx = df.index[-1]
+        old_high = _num(df.at[idx, "High"]) or price
+        old_low = _num(df.at[idx, "Low"]) or price
+        df.at[idx, "Close"] = price
+        df.at[idx, "High"] = max(old_high, high, price)
+        df.at[idx, "Low"] = min(old_low, low, price)
+        if quote.get("volume") is not None:
+            df.at[idx, "Volume"] = _num(quote.get("volume")) or df.at[idx, "Volume"]
+        return df
+    except Exception:
+        return hist
+
+
+def _patch_tf_with_quote(tf_payload: Optional[dict[str, Any]], quote: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not tf_payload:
+        return tf_payload
+    patched_hist = _patch_latest_candle(tf_payload.get("hist"), quote)
+    close = patched_hist["Close"].astype(float) if patched_hist is not None and not patched_hist.empty else None
+    price = _num(quote.get("price")) or tf_payload.get("price")
+    tf_payload["hist"] = patched_hist
+    tf_payload["price"] = price
+    if close is not None:
+        tf_payload["ma5"] = _ma(close, 5)
+        tf_payload["ma20"] = _ma(close, 20)
+        tf_payload["ma60"] = _ma(close, 60)
+    return tf_payload
+
+
 def _patch_with_quote(data: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
     if not quote:
         return data
@@ -261,10 +300,20 @@ def get_special_market_data(query: str) -> Optional[dict[str, Any]]:
 
     data = _patch_with_quote(data, quote)
 
-    # 報價頁比 yfinance 更新時，讓三週期的 price 跟著最新價，避免卡片上價格和判斷不一致。
+    # 報價頁比 yfinance 更新時，用最新報價校正最後一根K。
     if quote.get("price") is not None:
+        data["hist"] = _patch_latest_candle(data.get("hist"), quote)
+        close2 = data["hist"]["Close"].astype(float) if data.get("hist") is not None and not data["hist"].empty else close
+        data["ma5"] = _ma(close2, 5)
+        data["ma20"] = _ma(close2, 20)
+        data["ma60"] = _ma(close2, 60)
         for tf_key in ("1d", "60m", "5m"):
             if data["tf"].get(tf_key):
-                data["tf"][tf_key]["price"] = data["price"]
+                data["tf"][tf_key] = _patch_tf_with_quote(data["tf"][tf_key], quote)
+        data["kline_quality"] = "即時報價校正K線"
+        data["realtime_kline"] = True
+    else:
+        data.setdefault("kline_quality", "Yahoo K線")
+        data.setdefault("realtime_kline", False)
 
     return data
