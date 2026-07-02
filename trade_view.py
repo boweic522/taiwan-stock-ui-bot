@@ -498,6 +498,88 @@ def _entry_rating(score: int) -> tuple[str, str]:
     return "D", "不適合進場"
 
 
+def _chase_risk(data: dict, position: dict, gap: Optional[dict] = None) -> str:
+    """追價風險：用距離防守、漲幅、缺口未回測來壓制追價衝動。"""
+    price = _num(data.get("price"))
+    change_pct = _num(data.get("change_pct")) or 0.0
+    defense = _num(position.get("defense"))
+    ratio, _, _ = _volume_meta(data)
+    risk = 0
+    if price is not None and defense is not None and price > 0:
+        dist = (price - defense) / price * 100
+        if dist > 8:
+            risk += 2
+        elif dist > 4:
+            risk += 1
+    if change_pct >= 5:
+        risk += 2 if ratio >= 1.3 else 1
+    if gap and gap.get("event") == "跳空向上缺口" and gap.get("valid"):
+        risk += 1
+    if risk >= 3:
+        return "高"
+    if risk >= 1:
+        return "中"
+    return "低"
+
+
+def _operation_stage(status: str, data: dict, pa: dict, position: dict, intraday: Optional[dict], three: Optional[dict], gap: Optional[dict], d_label: str, h_label: str, m_label: str) -> str:
+    """把老吳式操作節奏轉成階段：等待 / 試單 / 加碼 / 持有 / 防守 / 失效。"""
+    pa_event = pa.get("event", "")
+    if status == "避開" or _three_short(three) or pa_event in ("長紅後跌破低點", "5分紅K低點失守"):
+        return "失效"
+    if _three_long(three) or _intraday_valid(intraday):
+        return "試單"
+    if status == "可做" and h_label == "偏多" and m_label == "偏多":
+        return "持有"
+    if status in ("可做", "觀察") and h_label in ("偏多", "短線反彈") and m_label == "偏多":
+        return "加碼"
+    if status in ("等修復", "反彈觀察", "觀察"):
+        return "防守"
+    return "等待"
+
+
+def _footer_meta(data: dict) -> str:
+    """資料狀態放 footer，不塞主畫面。"""
+    quote = str(data.get("quote_quality") or "Yahoo Finance報價").strip()
+    kline = str(data.get("kline_quality") or ("即時報價校正K線" if data.get("realtime_kline") else "Yahoo K線")).strip()
+    qtime = str(data.get("quote_time") or "").strip()
+    note = str(data.get("quote_note") or "").strip()
+    parts = [quote]
+    if qtime:
+        parts.append(qtime)
+    parts.append(kline)
+    if note:
+        parts.append(note)
+    return "｜".join(parts)
+
+
+def _detail_text(data: dict, pa: dict, gap: dict, structure: dict, keymap: dict, intraday: dict, three: dict, chase: str, d_label: str, h_label: str, m_label: str) -> str:
+    """詳細模式用，不放在精簡卡。"""
+    lines = [
+        f"三週期：日K{_clean_label(d_label)}｜60分{_clean_label(h_label)}｜5分{_clean_label(m_label)}",
+        f"盤型：{structure.get('pattern', '資料不足')}｜追價：{chase}",
+    ]
+    if gap.get("event") != "無明顯缺口":
+        lines.append(f"跳空：{gap.get('event')}｜{gap.get('reading', '')}")
+    if pa.get("event") not in ("一般結構", "資料不足", ""):
+        lines.append(f"K棒：{pa.get('event')}｜{pa.get('reading', '')}")
+    if intraday.get("event") not in ("無盤中試多訊號", "5分資料不足", ""):
+        lines.append(f"5K：{intraday.get('event')}｜{intraday.get('reading', '')}")
+    if three.get("event"):
+        lines.append(f"三根K：{three.get('event')}｜{three.get('reading', '')}")
+    km = []
+    for key, label in [
+        ("dead_pressure", "前高"), ("dead_support", "前低"),
+        ("wave60_high", "60K波高"), ("wave60_low", "60K波低"),
+        ("attack5_high", "5K攻擊"), ("defense5_low", "5K防守"),
+    ]:
+        if keymap.get(key) is not None:
+            km.append(f"{label}{fmt_price(keymap.get(key))}")
+    if km:
+        lines.append("關鍵位：" + "｜".join(km[:6]))
+    return "\n".join([line for line in lines if line.strip()])
+
+
 # ────────────────────────────────────────────
 # 6. 文案組裝
 # ────────────────────────────────────────────
@@ -601,20 +683,13 @@ def _trade_plan(status: str, data: dict, pa: dict, position: dict, h_label: str,
         entry = "日K與60分方向一致後再評估"
         invalid = f"跌破 {defense} 且放量"
 
-    return f"觀察：{observe}\n進場：{entry}\n失敗：{invalid}"
+    return f"試單：{observe}\n加碼：{entry}\n失效：{invalid}"
 
 
-def _quote_text(data: dict) -> str:
-    quality = str(data.get("quote_quality") or "Yahoo Finance報價").strip()
-    note = str(data.get("quote_note") or "").strip()
-    if note:
-        return f"報價：{quality}｜{note}"
-    return f"報價：{quality}"
-
-
-def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optional[dict] = None, structure: Optional[dict] = None, three: Optional[dict] = None) -> str:
+def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optional[dict] = None, structure: Optional[dict] = None, three: Optional[dict] = None, chase: str = "低", stage: str = "等待") -> str:
     lines = [build_compact_cycle_text(d_label, h_label, m_label)]
     lines.append(f"{_structure_text(structure)}｜量能：{compact_volume_text(data)}")
+    lines.append(f"階段：{stage}｜追價：{chase}")
     if _three_long(three):
         lines.append("訊號：三根K試多")
     elif _three_short(three):
@@ -623,7 +698,6 @@ def _extra(d_label: str, h_label: str, m_label: str, data: dict, intraday: Optio
         lines.append("觸發：5分試多")
     elif _intraday_watch(intraday):
         lines.append("觀察：5分紅K低點")
-    lines.append(_quote_text(data))
     return "\n".join(lines)
 
 
@@ -686,6 +760,8 @@ def build_trade_view(data: dict) -> dict:
     if structure.get("pattern") in ("多頭整理盤", "多頭反轉盤") and status != "避開":
         entry_score += 1
     entry_rating, entry_tagline = _entry_rating(entry_score)
+    chase = _chase_risk(data, position, gap)
+    stage = _operation_stage(status, data, pa, position, intraday if not high_risk else None, three if not high_risk else None, gap, d_label, h_label, m_label)
 
     price_line = _price_line(data.get("price"), data.get("change"), data.get("change_pct"))
     headline = _headline(status, d_label, h_label, m_label, pa_event, data, position, intraday if not high_risk else None)
@@ -707,7 +783,9 @@ def build_trade_view(data: dict) -> dict:
         scenario = f"{structure.get('pattern')}：{structure.get('reading')}\n等待關鍵位表態。"
 
     trade_plan = _trade_plan(status, data, pa, position, h_label, intraday if not high_risk else None, three if not high_risk else None)
-    extra = _extra(d_label, h_label, m_label, data, intraday if not high_risk else None, structure, three if not high_risk else None)
+    extra = _extra(d_label, h_label, m_label, data, intraday if not high_risk else None, structure, three if not high_risk else None, chase, stage)
+    detail = _detail_text(data, pa, gap, structure, keymap, intraday if not high_risk else {}, three if not high_risk else {}, chase, d_label, h_label, m_label)
+    footer_meta = _footer_meta(data)
 
     return {
         "status": status,
@@ -716,6 +794,10 @@ def build_trade_view(data: dict) -> dict:
         "price_line": price_line,
         "trend_rating": trend_rating,
         "entry_rating": entry_rating,
+        "operation_stage": stage,
+        "chase_risk": chase,
+        "footer_meta": footer_meta,
+        "detail": detail,
         "trend_text": f"趨勢：{trend_rating}",
         "entry_text": f"買點：{entry_rating}",
         "tagline": tagline,
