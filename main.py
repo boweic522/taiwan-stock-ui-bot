@@ -53,7 +53,8 @@ def _build_embed(data: dict, trade: dict, has_chart: bool = True, detail: bool =
     embed = discord.Embed(
         title=f"{trade['title_icon']} {display_name} {data['code']}｜{trade['status']}",
         description=(
-            f"💰 **{trade['price_line']}**\n"
+            f"**💰 現價｜{trade['price_line']}**\n"
+            f"━━━━━━━━━━━━\n"
             f"趨勢：**{trade['trend_rating']}**｜買點：**{trade['entry_rating']}**｜階段：**{trade.get('operation_stage', '等待')}**"
         ),
         color=trade["color"],
