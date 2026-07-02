@@ -38,28 +38,73 @@ def _resolve_chinese_name(data: dict, fallback_code: str = "") -> str:
 
 
 # ────────────────────────────────────────────
-# K 線切換 View
+# Embed 組裝
+# ────────────────────────────────────────────
+
+def _footer_text(trade: dict, tf_label: str) -> str:
+    meta = str(trade.get("footer_meta") or "").strip()
+    if meta:
+        return f"Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜{tf_label}｜{meta}"
+    return f"Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜{tf_label}"
+
+
+def _build_embed(data: dict, trade: dict, has_chart: bool = True, detail: bool = False, tf_label: str = "日K") -> discord.Embed:
+    display_name = data.get("display_name") or _resolve_chinese_name(data)
+    embed = discord.Embed(
+        title=f"{trade['title_icon']} {display_name} {data['code']}｜{trade['status']}",
+        description=(
+            f"💰 **{trade['price_line']}**\n"
+            f"趨勢：**{trade['trend_rating']}**｜買點：**{trade['entry_rating']}**｜階段：**{trade.get('operation_stage', '等待')}**"
+        ),
+        color=trade["color"],
+    )
+
+    embed.add_field(name="🎯 一句話", value=trade["headline"], inline=False)
+    embed.add_field(name="🧩 劇本", value=trade["scenario"], inline=False)
+    embed.add_field(name="📍 位置", value=trade["position"], inline=False)
+    embed.add_field(name="🚦 計畫", value=trade["trade_plan"], inline=False)
+    embed.add_field(name="📊 補充", value=trade["extra"], inline=False)
+
+    if detail:
+        detail_text = str(trade.get("detail") or "暫無額外細節").strip()
+        # Discord field value 1024 字限制；先截短，避免爆掉。
+        if len(detail_text) > 1000:
+            detail_text = detail_text[:997] + "..."
+        embed.add_field(name="🔎 詳細判斷", value=detail_text, inline=False)
+
+    if has_chart:
+        embed.set_image(url="attachment://chart.png")
+    embed.set_footer(text=_footer_text(trade, tf_label if has_chart else "文字卡"))
+    return embed
+
+
+# ────────────────────────────────────────────
+# K 線切換 + 詳細/精簡 View
 # ────────────────────────────────────────────
 
 class ChartView(discord.ui.View):
     TF_LABEL = {"1d": "日K", "60m": "60分K", "5m": "5分K"}
 
-    def __init__(self, data: dict, embed: discord.Embed):
+    def __init__(self, data: dict, trade: dict, has_chart: bool = True):
         super().__init__(timeout=300)
         self.data = data
-        self.embed = embed
+        self.trade = trade
+        self.has_chart = has_chart
         self.current_tf = "1d"
+        self.detail = False
         self._refresh_buttons()
 
     def _refresh_buttons(self):
         for child in self.children:
-            if isinstance(child, discord.ui.Button):
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.custom_id in self.TF_LABEL:
                 is_current = child.custom_id == self.current_tf
-                child.disabled = is_current
-                child.style = (
-                    discord.ButtonStyle.primary if is_current
-                    else discord.ButtonStyle.secondary
-                )
+                child.disabled = is_current or not self.has_chart
+                child.style = discord.ButtonStyle.primary if is_current else discord.ButtonStyle.secondary
+            elif child.custom_id == "toggle_detail":
+                child.label = "精簡" if self.detail else "詳細"
+                child.style = discord.ButtonStyle.success if self.detail else discord.ButtonStyle.secondary
 
     @discord.ui.button(label="日K", custom_id="1d")
     async def btn_daily(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -73,12 +118,24 @@ class ChartView(discord.ui.View):
     async def btn_5m(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._switch(interaction, "5m")
 
+    @discord.ui.button(label="詳細", custom_id="toggle_detail")
+    async def btn_detail(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.detail = not self.detail
+        self._refresh_buttons()
+        embed = _build_embed(
+            self.data,
+            self.trade,
+            has_chart=self.has_chart,
+            detail=self.detail,
+            tf_label=self.TF_LABEL.get(self.current_tf, "日K"),
+        )
+        await interaction.message.edit(embed=embed, view=self)
+
     async def _switch(self, interaction: discord.Interaction, tf_key: str):
-        tf_data = self.data["tf"].get(tf_key)
+        tf_data = (self.data.get("tf") or {}).get(tf_key)
         if tf_data is None:
-            await interaction.response.send_message(
-                f"❌ {self.TF_LABEL[tf_key]} 資料不足", ephemeral=True
-            )
+            await interaction.response.send_message(f"❌ {self.TF_LABEL[tf_key]} 資料不足", ephemeral=True)
             return
 
         await interaction.response.defer()
@@ -94,16 +151,17 @@ class ChartView(discord.ui.View):
             return
 
         self.current_tf = tf_key
+        self.has_chart = True
         self._refresh_buttons()
-        self.embed.set_footer(
-            text=(
-                f"Yahoo Finance｜Trader Camp Intelligence｜"
-                f"非投資建議｜{self.TF_LABEL[tf_key]}"
-            )
+        embed = _build_embed(
+            self.data,
+            self.trade,
+            has_chart=True,
+            detail=self.detail,
+            tf_label=self.TF_LABEL[tf_key],
         )
-        self.embed.set_image(url="attachment://chart.png")
         await interaction.message.edit(
-            embed=self.embed,
+            embed=embed,
             attachments=[discord.File(chart_buf, filename="chart.png")],
             view=self,
         )
@@ -137,7 +195,6 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
         return
 
     async with ctx.typing():
-        # 特殊市場項目：加權 / 櫃買 / 小台
         if is_special_market_query(query):
             data = get_special_market_data(query)
             if data is None:
@@ -169,49 +226,19 @@ async def handle_stock_query(ctx: commands.Context, code: str) -> None:
         try:
             hist = data.get("hist")
             if hist is not None and not getattr(hist, "empty", True):
-                chart_buf = generate_chart(
-                    hist, data["code"], data["display_name"], data["price"]
-                )
+                chart_buf = generate_chart(hist, data["code"], data["display_name"], data["price"])
                 chart_ok = True
         except Exception as e:
-            # 大盤 / 期貨資料源偶爾沒有完整 K 線；文字卡仍可先回覆。
             logger.warning("圖表產生失敗，改送文字卡: %s", e)
 
         trade = build_trade_view(data)
-        embed = _build_embed(data, trade, has_chart=chart_ok)
+        embed = _build_embed(data, trade, has_chart=chart_ok, detail=False, tf_label="日K")
 
+    view = ChartView(data, trade, has_chart=chart_ok)
     if chart_ok and chart_buf is not None:
-        view = ChartView(data, embed)
         await ctx.send(embed=embed, file=discord.File(chart_buf, filename="chart.png"), view=view)
     else:
-        await ctx.send(embed=embed)
-
-
-def _build_embed(data: dict, trade: dict, has_chart: bool = True) -> discord.Embed:
-    display_name = data.get("display_name") or _resolve_chinese_name(data)
-    embed = discord.Embed(
-        title=(
-            f"{trade['title_icon']} {display_name} {data['code']}"
-            f"｜{trade['status']}"
-        ),
-        description=(
-            f"{trade['price_line']}\n"
-            f"趨勢：**{trade['trend_rating']}**｜買點：**{trade['entry_rating']}**"
-        ),
-        color=trade["color"],
-    )
-    embed.add_field(name="🎯 一句話", value=trade["headline"], inline=False)
-    embed.add_field(name="🧩 劇本", value=trade["scenario"], inline=False)
-    embed.add_field(name="📍 位置", value=trade["position"], inline=False)
-    embed.add_field(name="🚦 計畫", value=trade["trade_plan"], inline=False)
-    embed.add_field(name="📊 補充", value=trade["extra"], inline=False)
-    if has_chart:
-        embed.set_image(url="attachment://chart.png")
-        footer_tf = "日K"
-    else:
-        footer_tf = "文字卡"
-    embed.set_footer(text=f"Yahoo Finance｜Trader Camp Intelligence｜非投資建議｜{footer_tf}")
-    return embed
+        await ctx.send(embed=embed, view=view)
 
 
 # ────────────────────────────────────────────
@@ -226,17 +253,16 @@ async def on_message(message: discord.Message):
     content = (message.content or "").strip()
     lower = content.lower()
 
-    # 支援：/K2330、/K 2330、/k台積電、/k 台積電
+    # 支援：/K2330、/K 2330、/k台積電、/k 台積電、/K小台
     if lower.startswith("/k"):
         query = content[2:].strip()
         if not query:
-            await message.channel.send("請輸入股票代號或公司名稱，例如：`/K2330` 或 `/K台積電`")
+            await message.channel.send("請輸入股票代號、公司名稱或大盤項目，例如：`/K2330`、`/K台積電`、`/K小台`")
             return
         ctx = await bot.get_context(message)
         await handle_stock_query(ctx, query)
         return
 
-    # 舊的 !股 / !查 / !k 指令保留，避免既有使用者突然不能用。
     await bot.process_commands(message)
 
 
@@ -280,23 +306,18 @@ async def cmd_help(ctx: commands.Context):
         value=(
             "`/K2330` — 用股票代號查詢\n"
             "`/K台積電` — 用公司名稱查詢\n"
-            "`/K 台達電` — 中間有空格也可以"
+            "`/K加權`、`/K櫃買`、`/K小台` — 查詢大盤項目"
         ),
         inline=False,
     )
     embed.add_field(
         name="📌 顯示內容",
-        value="一句話｜劇本｜位置｜計畫｜補充；支援個股、加權、櫃買、小台。",
+        value="一句話｜劇本｜位置｜計畫｜補充；按鈕可切換日K、60分K、5分K與詳細模式。",
         inline=False,
     )
     embed.add_field(
         name="🎯 評級說明",
-        value="趨勢評級看強弱；買點評級看現在適不適合進場。",
-        inline=False,
-    )
-    embed.add_field(
-        name="📐 圖表",
-        value="日K / 60分K / 5分K 按鈕可切換。",
+        value="趨勢評級看強弱；買點評級看位置；階段顯示等待、試單、加碼、持有、防守或失效。",
         inline=False,
     )
     embed.set_footer(text="Trader Camp Intelligence Bot｜非投資建議")
